@@ -8,11 +8,20 @@ household chores in a shared real-time view. See `spec.md` for the v1 product sp
 - Node.js + **Fastify**
 - **Drizzle ORM** on **Postgres**
 - **Argon2id** password & PIN hashing
-- HTTP-only cookie sessions (no JWTs)
+- **Hybrid sessions** — opaque tokens stored in `sessions`, sent as either an
+  HTTP-only cookie (web) or an `Authorization: Bearer <token>` header (the
+  Capacitor native app, which can't reliably do cross-origin cookies)
 - In-process job runner for chore renewals + weekly payouts (no Redis)
 - **SSE** for real-time fan-out, one stream per session
 
-Single deploy: this server can also serve the built web client (set `WEB_DIST_DIR`).
+Single deploy: this server also serves the built web client (set `WEB_DIST_DIR`).
+Production layout:
+
+| Hostname             | Served from this Render service?               |
+|----------------------|------------------------------------------------|
+| `app.choreboard.io`  | Yes — the SPA (`ChoreBoard-Web/dist`).         |
+| `api.choreboard.io`  | Yes — JSON API + SSE at `/api/*`.              |
+| `choreboard.io`      | No — static landing site on Cloudflare Pages.  |
 
 ## Project layout
 
@@ -132,8 +141,14 @@ should listen for the event names and refetch the relevant React Query keys.
 These are scaffolded in the schema / event bus but not yet wired end-to-end:
 
 - Photo uploads to R2 (column `photo_key` exists; presign endpoint TBD).
-- Web Push (`push_subscriptions` table, `web-push` library not yet wired).
+- Push — Web Push (`push_subscriptions`, `web-push`) for browser sessions
+  *and* APNs/FCM (`device_tokens`, `@parse/node-apn` + Firebase Admin) for
+  Capacitor native sessions. New route: `src/routes/devices.ts`.
 - Email (Resend) — championship-of-the-week + payout summary.
+- Billing — Stripe (web), Apple StoreKit (iOS IAP), Google Play Billing
+  (Android IAP), all syncing into the `subscriptions` table. Same headline
+  price on every surface, platform fee absorbed by us. New route:
+  `src/routes/billing.ts`. See `spec.md` §16.
 
 Adding any of these is a matter of dropping in a new route module and a
 publisher subscribing to the relevant `FamilyEvent`.

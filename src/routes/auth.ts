@@ -2,11 +2,17 @@ import type { FastifyInstance } from 'fastify';
 import { and, eq } from 'drizzle-orm';
 import { z } from 'zod';
 import { db } from '../db/client.js';
-import { families, kids, users, chores } from '../db/schema.js';
+import { families, kids, users, chores, sessions } from '../db/schema.js';
 import { hashPassword, verifyPassword, verifyPin } from '../auth/password.js';
-import { endSession, startKidSession, startParentSession } from '../auth/plugin.js';
+import {
+  endSession,
+  pickTransport,
+  startKidSession,
+  startParentSession,
+} from '../auth/plugin.js';
 import { DEFAULT_CATALOG } from '../domain/defaultCatalog.js';
 import { scheduler } from '../scheduler/runner.js';
+import { bus } from '../realtime/bus.js';
 
 export async function authRoutes(app: FastifyInstance): Promise<void> {
   // ----- Parent signup (creates family + seeds catalog) --------------------
@@ -57,8 +63,12 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     await scheduler.materializeFamily(family!.id);
     await scheduler.ensureWeekCloseJob(family!.id);
 
-    await startParentSession(reply, user!.id, family!.id);
-    return { user: publicUser(user!), family: { id: family!.id, name: family!.name } };
+    const session = await startParentSession(reply, user!.id, family!.id, pickTransport(req));
+    return {
+      user: publicUser(user!),
+      family: { id: family!.id, name: family!.name },
+      session,
+    };
   });
 
   // ----- Parent login ------------------------------------------------------
@@ -71,8 +81,8 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     const ok = await verifyPassword(u.passwordHash, body.password);
     if (!ok) return reply.code(401).send({ error: 'invalid_credentials' });
 
-    await startParentSession(reply, u.id, u.familyId);
-    return { user: publicUser(u) };
+    const session = await startParentSession(reply, u.id, u.familyId, pickTransport(req));
+    return { user: publicUser(u), session };
   });
 
   // ----- Family kid roster (for the PIN entry screen) ----------------------
@@ -107,8 +117,11 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     if (!k) return reply.code(401).send({ error: 'invalid_pin' });
     const ok = await verifyPin(k.pinHash, body.pin);
     if (!ok) return reply.code(401).send({ error: 'invalid_pin' });
-    await startKidSession(reply, k.id, k.familyId);
-    return { kid: { id: k.id, name: k.name, color: k.color, avatar: k.avatar } };
+    const session = await startKidSession(reply, k.id, k.familyId, pickTransport(req));
+    return {
+      kid: { id: k.id, name: k.name, color: k.color, avatar: k.avatar },
+      session,
+    };
   });
 
   // ----- Logout ------------------------------------------------------------
@@ -121,6 +134,71 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
   app.get('/auth/me', async (req, _reply) => {
     if (!req.principal) return { principal: null };
     return { principal: req.principal };
+  });
+
+  // ----- Delete own account ------------------------------------------------
+  // A non-owner parent can delete their own user account. Owners must use
+  // DELETE /auth/family below (which deletes the entire family) — orphaning
+  // the family is worse than a clear refusal here.
+  //
+  // Kids are managed by parents via /family/kids/:id and can't self-delete
+  // from a shared device.
+  app.delete('/auth/me', async (req, reply) => {
+    const p = req.requireParent();
+    if (p.role === 'owner') {
+      return reply.code(409).send({ error: 'owner_cannot_self_delete' });
+    }
+
+    // Drop sessions explicitly: the column has no FK so cascade won't catch them.
+    await db.delete(sessions).where(eq(sessions.userId, p.userId));
+    await db.delete(users).where(eq(users.id, p.userId));
+
+    reply.clearSessionCookie();
+    bus.publish(p.familyId, { type: 'family.updated' });
+    return { ok: true };
+  });
+
+  // ----- Owner: delete entire family --------------------------------------
+  // Both the App Store and Play Store require an in-app account deletion
+  // path. For an owner, "delete my account" semantically means "delete the
+  // family" because the family can't keep running without one — there is no
+  // ownership-transfer flow in v1.
+  //
+  // This deletes the family row, which cascades to users, kids, chores,
+  // chore_instances, ledger_entries, weeks, goals, badges_awarded, streaks,
+  // xp_log, sessions, push_subscriptions (via users), device_tokens (via
+  // users), subscriptions, and scheduled_jobs. (See schema.ts for the
+  // ON DELETE CASCADE relationships.)
+  //
+  // The owner's own login is invalidated when their session row is wiped by
+  // the cascade through `users → families`.
+  app.delete('/auth/family', async (req, reply) => {
+    const p = req.requireParent();
+    if (p.role !== 'owner') {
+      return reply.code(403).send({ error: 'owner_only' });
+    }
+    const body = z
+      .object({
+        // Defence-in-depth: require the owner to type their family name to
+        // confirm. Mirrors the GitHub "delete this repo" UX.
+        confirmFamilyName: z.string().min(1).max(64),
+      })
+      .parse(req.body);
+
+    const [fam] = await db
+      .select({ id: families.id, name: families.name })
+      .from(families)
+      .where(eq(families.id, p.familyId))
+      .limit(1);
+    if (!fam) return reply.code(404).send({ error: 'not_found' });
+    if (body.confirmFamilyName !== fam.name) {
+      return reply.code(400).send({ error: 'confirmation_mismatch' });
+    }
+
+    bus.publish(p.familyId, { type: 'family.updated' });
+    await db.delete(families).where(eq(families.id, fam.id));
+    reply.clearSessionCookie();
+    return { ok: true };
   });
 }
 

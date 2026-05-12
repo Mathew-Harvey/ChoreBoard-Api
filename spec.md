@@ -142,14 +142,19 @@ Every approved chore writes a row to `ledger_entries` immediately, with `status 
 
 ## 10. Notifications
 
-Web Push (PWA install) for parents only. Triggers:
+Push for parents only. Triggers:
 
-- Kid submits a chore for approval (with link straight to Approve/Reject).
+- Kid submits a chore for approval (with deep link straight to Approve/Reject).
 - Goal hit by a kid.
 - Champion of the week announced.
 - (Configurable per parent.)
 
-iOS supports Web Push only when the PWA is installed to home screen, which we'll explain in onboarding. Android and desktop work out of the box. Email fallback for "Champion of the week" and "weekly payout summary" so parents who don't install the PWA still get the headlines.
+Two delivery transports, picked based on which client the parent is using:
+
+- **Native (iOS + Android)** — APNs and FCM via the Capacitor app. Tokens are registered with `POST /api/devices` on login and stored in `device_tokens`. This is the default we push parents toward, because the install path is the App Store / Play Store rather than "add to home screen".
+- **Web** — `web-push` to standard Web Push subscriptions, used for parents who only sign in on a browser (e.g. desktop). iOS Safari Web Push is intentionally out of scope; iOS users get the native app instead.
+
+Email fallback (Resend) for "Champion of the week" and "weekly payout summary" so parents who haven't installed the app still get the headlines.
 
 ---
 
@@ -161,17 +166,33 @@ Server-Sent Events (SSE), one stream per authenticated session, scoped to that f
 
 ## 12. Tech stack
 
-Single repo, monorepo-light (one server, one web client, shared types).
+Three repos, all small (one server, one web client, one static landing).
 
-- **Backend:** Node.js + Fastify. Drizzle ORM. Postgres on Render. Argon2 for password hashing. Cookie-based sessions (HTTP-only, SameSite=Lax) — not JWTs. A small in-process job runner (no Redis, no BullMQ) handles renewals and payouts via `setTimeout` driven by a `scheduled_jobs` table; on boot the server replays missed jobs. Render's single instance is fine for v1; if we ever scale out we swap in a real scheduler.
-- **Frontend:** Vite + React + TypeScript SPA. TanStack Query for server state. Zustand for tiny local UI state. `dnd-kit` for drag-and-drop on Kanban (touch + mouse). Tailwind for styling. PWA via Vite PWA plugin for installability + Web Push.
-- **Photos:** Cloudflare R2 (S3-compatible, no egress fees). Pre-signed URLs from the backend; client uploads direct. Thumbnails generated on the server with `sharp` on upload.
+- **Backend (`ChoreBoard-Api`):** Node.js + Fastify. Drizzle ORM. Postgres on Render. Argon2 for password hashing. **Hybrid sessions** — opaque session tokens stored in `sessions`, transported as either an HTTP-only `SameSite=Lax` cookie (web) or an `Authorization: Bearer <token>` header (native app). A small in-process job runner (no Redis, no BullMQ) handles renewals and payouts via `setTimeout` driven by a `scheduled_jobs` table; on boot the server replays missed jobs. Render's single instance is fine for v1; if we ever scale out we swap in a real scheduler.
+- **Frontend (`ChoreBoard-Web`):** Vite + React + TypeScript SPA. TanStack Query for server state. Zustand for tiny local UI state. `dnd-kit` for drag-and-drop on Kanban (touch + mouse). Tailwind for styling. The same SPA bundle is the web app at `app.choreboard.io` *and* the WebView payload inside the Capacitor native shells.
+- **Native (`ChoreBoard-Web/ios`, `ChoreBoard-Web/android`):** Capacitor wraps the SPA into iOS and Android apps. Native plugins used: `@capacitor/push-notifications` (APNs + FCM), `@capacitor/camera` (photo capture replacing the file picker), `@capacitor/haptics`, `@capacitor/preferences` (kitchen-tablet "remember which kid"), `@capacitor/app` + Universal Links / App Links for deep linking from push, `@capacitor/status-bar`, `@capacitor/splash-screen`, `@capacitor-community/in-app-purchases` for billing.
+- **Landing (`ChoreBoard-Landing`):** Static `index.html` + `terms.html` + `privacy.html`, no build step, served at `choreboard.io`.
+- **Photos:** Cloudflare R2 (S3-compatible, no egress fees). Pre-signed URLs from the backend; client uploads direct from web or via `@capacitor/camera` on native. Thumbnails generated on the server with `sharp` on upload.
 - **Email:** Resend (transactional only — signup verify, password reset, weekly payout summary).
-- **Web Push:** `web-push` library, VAPID keys in env.
-- **Hosting:** Render web service for the API (serves the built SPA too — single origin, single deploy). Render Postgres. Render Disk not needed (photos on R2).
-- **Telemetry:** PostHog (cheap, captures funnel + product analytics without much code). Sentry for errors.
+- **Push:** `web-push` library for browser subscriptions; APNs (`@parse/node-apn` or Firebase Admin) and FCM (Firebase Admin) for native devices. VAPID + APNs auth keys + FCM service-account JSON in env.
+- **Billing:** Stripe (subscriptions on web), Apple StoreKit (iOS IAP), Google Play Billing (Android IAP). All three sync state to a single `subscriptions` table keyed by `family_id`. See §16.
+- **Hosting:** Render web service for the API (also serves the built SPA at `app.choreboard.io` — single origin, single deploy). Render Postgres. Cloudflare Pages for the landing site. Cloudflare in front of everything for DNS + CDN. Render Disk not needed (photos on R2).
+- **Telemetry:** PostHog (cheap, captures funnel + product analytics without much code; configured first-party only so we don't need an iOS App Tracking Transparency prompt). Sentry for errors.
 
-No Redis, no message broker, no microservices, no Next.js, no Prisma, no auth-as-a-service. One server, one DB, one SPA.
+No Redis, no message broker, no microservices, no Next.js, no Prisma, no auth-as-a-service, no React Native rewrite. One server, one DB, one SPA, two thin native shells.
+
+### 12.1 Domains and DNS
+
+| Hostname              | Hosted on          | What it serves                                               |
+|-----------------------|--------------------|--------------------------------------------------------------|
+| `choreboard.io`       | Cloudflare Pages   | Marketing site (`ChoreBoard-Landing`), terms, privacy.       |
+| `app.choreboard.io`   | Render (Fastify)   | The SPA (`ChoreBoard-Web` build) served by the API process.  |
+| `api.choreboard.io`   | Render (Fastify)   | JSON API, SSE stream, push subscription endpoints, R2 presign. Same Render service as `app.`, just a second hostname. |
+| `assets.choreboard.io`| Cloudflare → R2    | Optional CNAME in front of the R2 bucket for chore photos.   |
+
+`api.choreboard.io` and `app.choreboard.io` resolve to the same Render service for v1. Splitting them now means we can move the SPA to Cloudflare Pages later without touching API URLs in the apps. Cookies are issued with `Domain=.choreboard.io` so a session set by `app.` is sent on calls to `api.` (web only — native uses bearer tokens regardless).
+
+`.well-known/apple-app-site-association` and `.well-known/assetlinks.json` are served from `app.choreboard.io` so iOS Universal Links and Android App Links open the native app instead of the browser when a parent taps a push deep-link.
 
 ---
 
@@ -191,8 +212,11 @@ badges_awarded      (id, member_type, member_id, badge_id, awarded_at, context_j
 streaks             (id, member_type, member_id, kind[daily|chore:<id>], length, last_day, best_length)
 xp_log              (id, member_type, member_id, delta, reason, created_at)
 push_subscriptions  (id, user_id, endpoint, p256dh, auth, created_at)
-sessions            (id, user_id|null, kid_id|null, family_id, expires_at)
+device_tokens       (id, user_id, platform[ios|android], token, app_version, created_at, last_seen_at)
+sessions            (id, user_id|null, kid_id|null, family_id, expires_at, transport[cookie|bearer])
 scheduled_jobs      (id, family_id, kind, run_at, payload_json, status)
+subscriptions       (id, family_id, plan[free|family], status[active|trialing|past_due|cancelled], source[stripe|apple|google], external_id, current_period_end, created_at, updated_at)
+billing_events      (id, family_id, source, kind, payload_json, received_at, processed_at)
 ```
 
 `member_type` + `member_id` is the polymorphic key for "user or kid". Slight ugliness but keeps the schema honest.
@@ -202,20 +226,76 @@ scheduled_jobs      (id, family_id, kind, run_at, payload_json, status)
 ## 14. Out of scope for v1
 
 - Multiple parents in different households / shared custody.
-- Real money rails (Stripe Connect, kids' debit cards). The app tracks owed $, the human hands over cash or does a bank transfer.
-- Native iOS/Android apps. PWA only.
+- Real money rails (Stripe Connect, kids' debit cards). The app tracks owed $, the human hands over cash or does a bank transfer. Stripe / Apple IAP / Google Play Billing are used only to charge parents for the *subscription* — see §16.
 - Chore dependencies ("vacuum before mop").
 - Photo evidence required (it's optional per chore for v1; "required" toggle is a v1.1 add).
 - Chore rotation / fairness assignment. v1 is pure claim-based.
 - i18n. English/AUD only on day one, but the codebase uses `Intl` from the start so this is easy later.
-- Billing. v1 is free / closed beta. Billing layer (Stripe + plans) is its own next step once we know the shape.
 
 ---
 
 ## 15. Open questions
 
 1. **Elodie's age.** Affects suggested $ amounts and PIN UX (younger kids → emoji/animal "PIN" instead of digits).
-2. **Pricing tiers when we open it up.** Free for one family, or freemium with a member cap? My instinct: free forever for up to 4 members, $5/month for more + advanced gamification + history export. Skip for v1 build, decide before launch.
-3. **Approval-on-touchscreen path.** A Parent standing at the touchscreen approving a Kid's chore — should they re-enter their parent PIN, or is being signed in on that device enough? I'd default to a short parent PIN prompt for the approval action so a Kid can't approve themselves from the family device.
-4. **Photo retention.** Forever, or auto-delete after 90 days? R2 storage is cheap but the photos add up. I'd default to 1-year retention with a setting to extend.
-5. **What does Skye think?** Worth a sanity check that the gamification level lands well for your household and isn't going to feel oppressive for the kid. Easy to dial down later but worth a gut check now.
+2. **Approval-on-touchscreen path.** A Parent standing at the touchscreen approving a Kid's chore — should they re-enter their parent PIN, or is being signed in on that device enough? I'd default to a short parent PIN prompt for the approval action so a Kid can't approve themselves from the family device.
+3. **Photo retention.** Forever, or auto-delete after 90 days? R2 storage is cheap but the photos add up. I'd default to 1-year retention with a setting to extend.
+4. **What does Skye think?** Worth a sanity check that the gamification level lands well for your household and isn't going to feel oppressive for the kid. Easy to dial down later but worth a gut check now.
+5. **Headline subscription price.** Spec'd pricing model is "free up to 4 members, $X/month for the Family plan above that + advanced gamification + history export." We need to lock the headline number before submitting to either app store, because the IAP product is created in App Store Connect / Play Console with a fixed tier. See §16.4.
+
+---
+
+## 16. Native apps + billing
+
+### 16.1 Native shells
+
+iOS and Android ship as **Capacitor** wrappers around the existing SPA, living in `ChoreBoard-Web/ios/` and `ChoreBoard-Web/android/`. The web bundle (`dist/`) is the WebView payload. We do **not** ship a separate React Native codebase; the SPA is the product on every surface.
+
+- iOS bundle ID: `io.choreboard.app`
+- Android package: `io.choreboard.app`
+- App display name: `ChoreBoard`
+
+The native shells are updated via `npx cap sync` after every web build. iOS submissions go through TestFlight → App Store. Android goes through Internal Testing → Closed Testing (12 testers / 14 days) → Production. CI cuts the web build, then a Mac runner (Codemagic or GitHub Actions macOS) builds and uploads the `.ipa`; an Ubuntu runner builds and uploads the `.aab`.
+
+### 16.2 Native-specific affordances
+
+- **Push** — native APNs / FCM tokens registered via `POST /api/devices` on login. Tap on push opens the right deep route (`/admin/approvals/:instanceId`) via Universal Links / App Links.
+- **Camera** — `@capacitor/camera` replaces `<input type="file">` for chore photos. Same R2 presigned-URL upload flow.
+- **Haptics** — light tick on claim, medium tick on submit, success notification on approval / level-up.
+- **Safe areas** — CSS `env(safe-area-inset-*)` on top bar and bottom dock. `viewport-fit=cover` already in `index.html`.
+- **Background SSE** — iOS aggressively suspends WebView SSE when the app is backgrounded. Native push fills the gap; SSE is "live updates while foregrounded".
+- **Long-press selection** — disabled on chore cards (`-webkit-touch-callout: none; user-select: none;`) so iOS doesn't show the context menu instead of starting a drag.
+
+### 16.3 App Store / Play Store policy posture
+
+- **Audience.** ChoreBoard is listed under **Productivity** (App Store) / **Productivity** (Play Store) and marketed at parents. We deliberately do *not* enter the Kids category / Designed for Families program, because that bans third-party analytics (kills PostHog) and adds parental-gate requirements on every external link. Parents are the customer; kids are users via PIN inside an account the parent owns.
+- **Sign in with Apple.** Not required, because we only support email + password and kid PINs — no third-party social login. If we ever add Google sign-in, we add Sign in with Apple at the same time.
+- **App Tracking Transparency.** Not required. PostHog is configured for first-party analytics only; no cross-app / cross-website tracking happens.
+- **Account deletion.** Mandatory in both stores. `DELETE /api/me` deletes the user; `DELETE /api/families/:id` (owner only) deletes the family. Settings → "Delete account" surfaces both.
+- **Demo account for App Review.** A canonical reviewer family (`reviewer+ios@choreboard.io` / fixed password, plus a kid PIN) is seeded in production at every release. Listed in App Review notes.
+- **Privacy nutrition labels / Data safety form.** Email, name, photos, and product analytics, all linked to the user, used for app functionality and analytics. No tracking, no third-party sharing. Privacy policy at `https://choreboard.io/privacy.html`.
+- **Kid PINs.** No COPPA verifiable-parental-consent burden because kids do not directly provide PII to us — the parent creates the kid record. Documented in the privacy policy.
+
+### 16.4 Billing — Stripe on web, IAP on native, same headline price
+
+The Family plan is sold at the **same user-facing price on every surface**. We absorb the platform commission as a cost of distribution rather than charging iOS/Android users more.
+
+| Surface          | Rail                | Net to ChoreBoard (after fees)  |
+|------------------|---------------------|---------------------------------|
+| Web (`app.`)     | Stripe subscription | ~97% of headline                |
+| iOS native       | Apple IAP           | ~70% (85% on Small Business Program after year 1, dropping to ~85% effective via SBP) |
+| Android native   | Google Play Billing | ~85% (15% under $1M lifetime per developer) |
+
+Implementation rules:
+
+- **One subscription product per surface, but a single `subscriptions` row per family.** When a parent buys via IAP we record `source = 'apple' | 'google'`; when they buy on web, `source = 'stripe'`. Switching surfaces requires the parent to cancel the existing subscription on the originating platform — we surface this clearly in `Settings → Billing`.
+- **Server-side validation.** App-side IAP receipts are forwarded to `POST /api/billing/iap/verify`, which validates against Apple's `verifyReceipt` / App Store Server API and Google Play Developer API, then writes to `subscriptions` and `billing_events`. Apple's App Store Server Notifications v2 and Google's Real-Time Developer Notifications hit `POST /api/billing/iap/webhook` for renewals, refunds, and grace-period transitions. Stripe webhooks hit `POST /api/billing/stripe/webhook`.
+- **Anti-steering.** Inside the iOS app, we **do not** mention web pricing or link to `app.choreboard.io` for purchasing. The native upgrade screen offers Apple IAP only. The web upgrade screen offers Stripe only. (Apple's external-link entitlement exists for some regions post-Epic but introduces a 27% commission and friction prompts; not worth it at our scale.)
+- **Grace period.** A 7-day grace period when an IAP renewal fails before the family drops to free. Mirrors what App Store / Play give us natively.
+- **Restore Purchases** button on the native billing screen for IAP, mandatory on iOS.
+- **Receipts source of truth.** If Stripe and an IAP both say active, we honour the more-recently-renewed one. The other is treated as "should be cancelled by user" and we nudge them in-app.
+
+### 16.5 Repo + deployment shape
+
+- `ChoreBoard-Web` gains `capacitor.config.ts`, an `ios/` and an `android/` folder (both committed; both produced by `npx cap add`). A new `npm run cap:sync` runs `vite build && cap sync`. Native release builds are not run from a developer's machine — they're cut by CI (macOS runner for iOS, Ubuntu runner for Android).
+- `ChoreBoard-Api` gains `src/routes/devices.ts` (push token CRUD), `src/routes/billing.ts` (Stripe + IAP webhooks + verify), `src/integrations/push.ts` (APNs + FCM dispatchers), and the `device_tokens`, `subscriptions`, `billing_events` tables.
+- `ChoreBoard-Landing` is unchanged in structure but its pricing copy and CTAs reference `https://app.choreboard.io` and explicitly call out "available on iOS and Android" once the apps are live.

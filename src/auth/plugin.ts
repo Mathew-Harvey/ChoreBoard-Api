@@ -25,6 +25,8 @@ export type KidPrincipal = {
 
 export type Principal = ParentPrincipal | KidPrincipal;
 
+export type SessionTransport = 'cookie' | 'bearer';
+
 declare module 'fastify' {
   interface FastifyRequest {
     session?: SessionRow;
@@ -38,6 +40,36 @@ declare module 'fastify' {
   }
 }
 
+/**
+ * Resolve the session token from one of three transports, in priority order:
+ *  1. `Authorization: Bearer <token>` header — used by the Capacitor native
+ *     app, which can't reliably round-trip cross-origin cookies on iOS WKWebView.
+ *  2. `?session=<token>` query string — used by EventSource on native, since
+ *     EventSource doesn't allow custom headers. Only honoured for the SSE
+ *     route to keep the surface area small (see SSE handler).
+ *  3. The session cookie — used by the browser SPA at app.choreboard.io.
+ *
+ * Returns the token plus the transport that supplied it (so we can stamp it
+ * onto fresh sessions and revoke by transport later).
+ */
+function readSessionToken(req: FastifyRequest): { token: string; transport: SessionTransport } | null {
+  const auth = req.headers.authorization;
+  if (auth && auth.startsWith('Bearer ')) {
+    const token = auth.slice('Bearer '.length).trim();
+    if (token) return { token, transport: 'bearer' };
+  }
+
+  const query = req.query as Record<string, string | undefined> | undefined;
+  if (query?.session && req.url.startsWith('/api/events')) {
+    return { token: query.session, transport: 'bearer' };
+  }
+
+  const cookieValue = req.cookies[config.sessionCookieName];
+  if (cookieValue) return { token: cookieValue, transport: 'cookie' };
+
+  return null;
+}
+
 export const authPlugin = fp(async (app) => {
   app.decorateReply('setSessionCookie', function (this: FastifyReply, sessionId: string) {
     this.setCookie(config.sessionCookieName, sessionId, {
@@ -46,12 +78,16 @@ export const authPlugin = fp(async (app) => {
       secure: isProd,
       path: '/',
       maxAge: config.sessionTtlDays * 24 * 60 * 60,
+      domain: config.cookieDomain || undefined,
     });
     return this;
   });
 
   app.decorateReply('clearSessionCookie', function (this: FastifyReply) {
-    this.clearCookie(config.sessionCookieName, { path: '/' });
+    this.clearCookie(config.sessionCookieName, {
+      path: '/',
+      domain: config.cookieDomain || undefined,
+    });
     return this;
   });
 
@@ -78,12 +114,13 @@ export const authPlugin = fp(async (app) => {
     return p;
   });
 
-  // Resolve the principal from the session cookie for every request.
+  // Resolve the principal from whichever transport supplied the session token
+  // for every request.
   app.addHook('onRequest', async (req) => {
-    const cookieValue = req.cookies[config.sessionCookieName];
-    if (!cookieValue) return;
+    const supplied = readSessionToken(req);
+    if (!supplied) return;
 
-    const session = await getSession(cookieValue);
+    const session = await getSession(supplied.token);
     if (!session) return;
 
     req.session = session;
@@ -115,16 +152,36 @@ export const authPlugin = fp(async (app) => {
   });
 });
 
-export async function startParentSession(reply: FastifyReply, userId: string, familyId: string) {
-  const s = await createSession({ familyId, userId });
-  reply.setSessionCookie(s.id);
-  return s;
+/**
+ * Bag returned by every login/signup. Web clients ignore `token` and rely on
+ * the cookie that `setSessionCookie` planted; native (Capacitor) clients store
+ * the token in `Capacitor.Preferences` and send it as `Authorization: Bearer`.
+ */
+export type SessionBag = {
+  token: string;
+  expiresAt: string; // ISO
+};
+
+export async function startParentSession(
+  reply: FastifyReply,
+  userId: string,
+  familyId: string,
+  transport: SessionTransport = 'cookie',
+): Promise<SessionBag> {
+  const s = await createSession({ familyId, userId, transport });
+  if (transport === 'cookie') reply.setSessionCookie(s.id);
+  return { token: s.id, expiresAt: s.expiresAt.toISOString() };
 }
 
-export async function startKidSession(reply: FastifyReply, kidId: string, familyId: string) {
-  const s = await createSession({ familyId, kidId });
-  reply.setSessionCookie(s.id);
-  return s;
+export async function startKidSession(
+  reply: FastifyReply,
+  kidId: string,
+  familyId: string,
+  transport: SessionTransport = 'cookie',
+): Promise<SessionBag> {
+  const s = await createSession({ familyId, kidId, transport });
+  if (transport === 'cookie') reply.setSessionCookie(s.id);
+  return { token: s.id, expiresAt: s.expiresAt.toISOString() };
 }
 
 export async function endSession(req: FastifyRequest, reply: FastifyReply) {
@@ -132,4 +189,18 @@ export async function endSession(req: FastifyRequest, reply: FastifyReply) {
     await deleteSession(req.session.id);
   }
   reply.clearSessionCookie();
+}
+
+/**
+ * Decide which transport a fresh login should use, based on the request that
+ * triggered the login. Native clients are expected to send a header on every
+ * request (including the login itself) so we sniff `X-Client: native`.
+ *
+ * Falls back to cookie for everything else, which keeps existing browser
+ * behaviour byte-identical.
+ */
+export function pickTransport(req: FastifyRequest): SessionTransport {
+  const hint = req.headers['x-client'];
+  if (typeof hint === 'string' && hint.toLowerCase() === 'native') return 'bearer';
+  return 'cookie';
 }

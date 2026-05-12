@@ -297,17 +297,22 @@ export const xpLog = pgTable(
 export const sessions = pgTable(
   'sessions',
   {
-    id: text('id').primaryKey(), // opaque random token, stored in cookie
+    id: text('id').primaryKey(), // opaque random token; sent as cookie OR Bearer
     userId: uuid('user_id'),
     kidId: uuid('kid_id'),
     familyId: uuid('family_id')
       .notNull()
       .references(() => families.id, { onDelete: 'cascade' }),
+    // 'cookie' for browser sessions, 'bearer' for Capacitor native sessions.
+    // Same opaque token regardless; this column is for telemetry + revoking
+    // all native sessions in a single sweep if a device is lost.
+    transport: text('transport').notNull().default('cookie'),
     expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => ({
     familyIdx: index('sessions_family_idx').on(t.familyId),
+    userIdx: index('sessions_user_idx').on(t.userId),
   }),
 );
 
@@ -325,6 +330,107 @@ export const pushSubscriptions = pgTable(
   },
   (t) => ({
     userIdx: index('push_user_idx').on(t.userId),
+    endpointIdx: uniqueIndex('push_user_endpoint_idx').on(t.userId, t.endpoint),
+  }),
+);
+
+// ----------------------------------------------------------------------------
+// Native push device tokens (Capacitor iOS/Android)
+// ----------------------------------------------------------------------------
+// One row per device per parent. We never store kid device tokens because kids
+// don't get push (only parents are notified about chore approvals etc.).
+
+export const platformEnum = pgEnum('device_platform', ['ios', 'android']);
+
+export const deviceTokens = pgTable(
+  'device_tokens',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    platform: platformEnum('platform').notNull(),
+    token: text('token').notNull(),
+    appVersion: text('app_version'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    lastSeenAt: timestamp('last_seen_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    userIdx: index('device_tokens_user_idx').on(t.userId),
+    // A given physical device should only have one row per user.
+    tokenIdx: uniqueIndex('device_tokens_user_token_idx').on(t.userId, t.token),
+  }),
+);
+
+// ----------------------------------------------------------------------------
+// Subscriptions / billing
+// ----------------------------------------------------------------------------
+// One subscription per family. `source` records which rail collected the
+// money (Stripe on web, Apple StoreKit on iOS, Google Play Billing on
+// Android). Headline price is the same on every surface — we eat the
+// platform fee on IAP.
+
+export const subscriptionSourceEnum = pgEnum('subscription_source', [
+  'stripe',
+  'apple',
+  'google',
+]);
+
+export const subscriptionStatusEnum = pgEnum('subscription_status', [
+  'trialing',
+  'active',
+  'past_due',
+  'cancelled',
+  'expired',
+]);
+
+export const subscriptionPlanEnum = pgEnum('subscription_plan', ['free', 'family']);
+
+export const subscriptions = pgTable(
+  'subscriptions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    familyId: uuid('family_id')
+      .notNull()
+      .references(() => families.id, { onDelete: 'cascade' }),
+    plan: subscriptionPlanEnum('plan').notNull().default('free'),
+    status: subscriptionStatusEnum('status').notNull().default('active'),
+    source: subscriptionSourceEnum('source'),
+    // External provider identifier:
+    //   stripe → "sub_..." (Stripe subscription ID)
+    //   apple  → original_transaction_id
+    //   google → purchaseToken
+    externalId: text('external_id'),
+    currentPeriodEnd: timestamp('current_period_end', { withTimezone: true }),
+    cancelAt: timestamp('cancel_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    familyUniq: uniqueIndex('subscriptions_family_uniq').on(t.familyId),
+  }),
+);
+
+// Append-only log of every webhook / verification we received from Stripe,
+// Apple, or Google. Lets us replay state if we ever screw up the projection
+// into `subscriptions`, and gives us an audit trail for refund disputes.
+export const billingEvents = pgTable(
+  'billing_events',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    familyId: uuid('family_id'), // nullable: webhook may arrive before we know the family
+    source: subscriptionSourceEnum('source').notNull(),
+    kind: text('kind').notNull(), // e.g. 'invoice.paid', 'DID_RENEW', 'SUBSCRIPTION_RENEWED'
+    externalEventId: text('external_event_id').notNull(),
+    payloadJson: jsonb('payload_json').notNull(),
+    receivedAt: timestamp('received_at', { withTimezone: true }).notNull().defaultNow(),
+    processedAt: timestamp('processed_at', { withTimezone: true }),
+    error: text('error'),
+  },
+  (t) => ({
+    // Idempotency key — if a webhook is replayed, we no-op.
+    eventUniq: uniqueIndex('billing_events_uniq').on(t.source, t.externalEventId),
+    familyIdx: index('billing_events_family_idx').on(t.familyId),
   }),
 );
 

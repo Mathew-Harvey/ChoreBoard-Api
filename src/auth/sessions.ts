@@ -14,6 +14,7 @@ export async function createSession(input: {
   familyId: string;
   userId?: string | null;
   kidId?: string | null;
+  transport?: 'cookie' | 'bearer';
 }): Promise<SessionRow> {
   const id = newSessionId();
   const expiresAt = new Date(Date.now() + config.sessionTtlDays * 24 * 60 * 60 * 1000);
@@ -24,6 +25,7 @@ export async function createSession(input: {
       familyId: input.familyId,
       userId: input.userId ?? null,
       kidId: input.kidId ?? null,
+      transport: input.transport ?? 'cookie',
       expiresAt,
     })
     .returning();

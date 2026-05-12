@@ -1,5 +1,4 @@
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import cookie from '@fastify/cookie';
@@ -14,6 +13,9 @@ import { statsRoutes } from './routes/stats.js';
 import { ledgerRoutes } from './routes/ledger.js';
 import { goalsRoutes } from './routes/goals.js';
 import { sseRoutes } from './routes/sse.js';
+import { devicesRoutes } from './routes/devices.js';
+import { billingRoutes } from './routes/billing.js';
+import { wellKnownRoutes } from './routes/wellKnown.js';
 import { scheduler } from './scheduler/runner.js';
 import { ensureBadgeCatalogSeeded } from './domain/gamification.js';
 
@@ -27,24 +29,40 @@ async function main() {
 
   await app.register(cookie, { secret: config.sessionSecret });
   await app.register(cors, {
-    origin: config.webOrigin === '*' ? true : config.webOrigin.split(','),
+    // WEB_ORIGIN is a comma-separated allowlist. In prod it must include
+    // both the web SPA host (https://app.choreboard.io) AND Capacitor's
+    // schemes (capacitor://localhost on iOS, https://localhost on Android)
+    // so the native shells can hit api.choreboard.io.
+    origin: config.webOrigin === '*' ? true : config.webOrigin.split(',').map((s) => s.trim()),
     credentials: true,
+    // Native sends `Authorization: Bearer ...` and `X-Client: native`.
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Client', 'Stripe-Signature'],
   });
 
   await app.register(authPlugin);
 
   app.get('/health', async () => ({ ok: true, time: new Date().toISOString() }));
 
-  await app.register(async (api) => {
-    await api.register(authRoutes);
-    await api.register(familyRoutes);
-    await api.register(choreRoutes);
-    await api.register(boardRoutes);
-    await api.register(statsRoutes);
-    await api.register(ledgerRoutes);
-    await api.register(goalsRoutes);
-    await api.register(sseRoutes);
-  }, { prefix: '/api' });
+  // .well-known files for Apple Universal Links + Android App Links.
+  // Mounted at the root, NOT under /api, because the OS expects exactly
+  // /.well-known/apple-app-site-association on app.choreboard.io.
+  await app.register(wellKnownRoutes);
+
+  await app.register(
+    async (api) => {
+      await api.register(authRoutes);
+      await api.register(familyRoutes);
+      await api.register(choreRoutes);
+      await api.register(boardRoutes);
+      await api.register(statsRoutes);
+      await api.register(ledgerRoutes);
+      await api.register(goalsRoutes);
+      await api.register(sseRoutes);
+      await api.register(devicesRoutes);
+      await api.register(billingRoutes);
+    },
+    { prefix: '/api' },
+  );
 
   // Serve the built SPA in production (single origin = single deploy).
   if (config.webDistDir) {
@@ -55,7 +73,11 @@ async function main() {
       wildcard: false,
     });
     app.setNotFoundHandler(async (req, reply) => {
-      if (req.url.startsWith('/api/')) return reply.code(404).send({ error: 'not_found' });
+      // Don't fallthrough to index.html for /api/* or /.well-known/* —
+      // those should 404 cleanly so misconfigured clients see a real error.
+      if (req.url.startsWith('/api/') || req.url.startsWith('/.well-known/')) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
       return reply.sendFile('index.html');
     });
   }
