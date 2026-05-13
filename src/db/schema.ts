@@ -434,6 +434,142 @@ export const billingEvents = pgTable(
   }),
 );
 
+// ----------------------------------------------------------------------------
+// Whiteboards & lists
+// ----------------------------------------------------------------------------
+// The "Family canvas" feature: a calendar that holds two kinds of artefact —
+// whiteboard sessions (free-form drawings the family did at a given date)
+// and lists (shopping lists, packing lists, todo lists). Each artefact is
+// optionally pinned to a single calendar date so the CalendarDesktop can
+// surface them at a glance.
+//
+// Whiteboard strokes are stored inline as a JSON array on the whiteboard row
+// itself. That trades a bit of write amplification for huge read simplicity:
+// the whole canvas comes back in one row, the realtime reconciler doesn't
+// need to merge per-stroke deltas, and tiny family sessions (a kid scribbles
+// for a minute) don't blow up our row count. If we ever need collaborative
+// live drawing we can split this out into a stroke table later.
+
+export const listKindEnum = pgEnum('list_kind', ['shopping', 'todo', 'packing', 'other']);
+
+export const whiteboards = pgTable(
+  'whiteboards',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    familyId: uuid('family_id')
+      .notNull()
+      .references(() => families.id, { onDelete: 'cascade' }),
+    title: text('title').notNull().default('Untitled board'),
+    // Optional calendar pin. YYYY-MM-DD in family timezone. Null means the
+    // board is unpinned and only shows in the "Recent" stack.
+    date: text('date'),
+    // Logical canvas size at the time of authoring. Renderers re-scale to
+    // fit the viewport; persisted so playback always lays out identically.
+    width: integer('width').notNull().default(1600),
+    height: integer('height').notNull().default(1000),
+    background: text('background').notNull().default('paper'),
+    // Strokes are persisted as a JSON array of {tool,color,size,points:[[x,y]…]}
+    // tuples. `pointsCount` is denormalised for cheap empty-board checks
+    // (e.g. "delete the auto-created board if nothing was drawn").
+    strokesJson: jsonb('strokes_json').notNull().default([]),
+    pointsCount: integer('points_count').notNull().default(0),
+    createdByUserId: uuid('created_by_user_id'),
+    createdByKidId: uuid('created_by_kid_id'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    familyIdx: index('whiteboards_family_idx').on(t.familyId),
+    familyDateIdx: index('whiteboards_family_date_idx').on(t.familyId, t.date),
+  }),
+);
+
+export const lists = pgTable(
+  'lists',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    familyId: uuid('family_id')
+      .notNull()
+      .references(() => families.id, { onDelete: 'cascade' }),
+    title: text('title').notNull(),
+    kind: listKindEnum('kind').notNull().default('shopping'),
+    // Optional calendar pin — YYYY-MM-DD in family TZ.
+    date: text('date'),
+    // For shopping lists: the supermarket source we should query when
+    // searching for products inside this list ('woolworths' for now). Null
+    // disables product enrichment entirely.
+    store: text('store'),
+    archivedAt: timestamp('archived_at', { withTimezone: true }),
+    createdByUserId: uuid('created_by_user_id'),
+    createdByKidId: uuid('created_by_kid_id'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    familyIdx: index('lists_family_idx').on(t.familyId),
+    familyDateIdx: index('lists_family_date_idx').on(t.familyId, t.date),
+  }),
+);
+
+export const listItems = pgTable(
+  'list_items',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    listId: uuid('list_id')
+      .notNull()
+      .references(() => lists.id, { onDelete: 'cascade' }),
+    familyId: uuid('family_id')
+      .notNull()
+      .references(() => families.id, { onDelete: 'cascade' }),
+    text: text('text').notNull(),
+    qty: integer('qty').notNull().default(1),
+    // Cached product card from the supermarket API (denormalised so the
+    // list renders even if the upstream is down). Shape matches what
+    // /api/products/* returns: { source, externalId, name, image, brand,
+    // packageSize, priceCents, wasPriceCents, onSpecial }.
+    productJson: jsonb('product_json'),
+    // Snapshot price at add-time so list totals are stable even if the
+    // upstream price changes later. We refresh on demand.
+    unitPriceCents: integer('unit_price_cents'),
+    checkedAt: timestamp('checked_at', { withTimezone: true }),
+    checkedByUserId: uuid('checked_by_user_id'),
+    checkedByKidId: uuid('checked_by_kid_id'),
+    sortOrder: integer('sort_order').notNull().default(0),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    listIdx: index('list_items_list_idx').on(t.listId),
+    familyIdx: index('list_items_family_idx').on(t.familyId),
+  }),
+);
+
+// Cache of products fetched from external supermarket APIs. Keyed by
+// (source, externalId) — externalId is the upstream's stock code (or the
+// barcode for barcode lookups). We refresh entries opportunistically when
+// a search/lookup hits an entry older than `productCacheTtlHours`.
+export const productCache = pgTable(
+  'product_cache',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    source: text('source').notNull(), // 'woolworths' for v1
+    externalId: text('external_id').notNull(),
+    name: text('name').notNull(),
+    brand: text('brand'),
+    image: text('image'),
+    packageSize: text('package_size'),
+    priceCents: integer('price_cents'),
+    wasPriceCents: integer('was_price_cents'),
+    onSpecial: boolean('on_special').notNull().default(false),
+    payloadJson: jsonb('payload_json'),
+    cachedAt: timestamp('cached_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    sourceExtUniq: uniqueIndex('product_cache_source_ext_uniq').on(t.source, t.externalId),
+    nameIdx: index('product_cache_name_idx').on(t.source, t.name),
+  }),
+);
+
 export const scheduledJobs = pgTable(
   'scheduled_jobs',
   {

@@ -15,6 +15,9 @@ import { goalsRoutes } from './routes/goals.js';
 import { sseRoutes } from './routes/sse.js';
 import { devicesRoutes } from './routes/devices.js';
 import { billingRoutes } from './routes/billing.js';
+import { whiteboardRoutes } from './routes/whiteboards.js';
+import { listsRoutes } from './routes/lists.js';
+import { productsRoutes } from './routes/products.js';
 import { wellKnownRoutes } from './routes/wellKnown.js';
 import { scheduler } from './scheduler/runner.js';
 import { ensureBadgeCatalogSeeded } from './domain/gamification.js';
@@ -60,6 +63,9 @@ async function main() {
       await api.register(sseRoutes);
       await api.register(devicesRoutes);
       await api.register(billingRoutes);
+      await api.register(whiteboardRoutes);
+      await api.register(listsRoutes);
+      await api.register(productsRoutes);
     },
     { prefix: '/api' },
   );

@@ -20,7 +20,14 @@ export type FamilyEvent =
     }
   | { type: 'level.up'; memberType: 'user' | 'kid'; memberId: string; level: number }
   | { type: 'ledger.paid'; memberType?: 'user' | 'kid'; memberId?: string; count: number }
-  | { type: 'family.updated' };
+  | { type: 'family.updated' }
+  | { type: 'whiteboard.created'; whiteboardId: string; date: string | null }
+  | { type: 'whiteboard.updated'; whiteboardId: string; date: string | null }
+  | { type: 'whiteboard.deleted'; whiteboardId: string; date: string | null }
+  | { type: 'list.created'; listId: string; date: string | null }
+  | { type: 'list.updated'; listId: string; date: string | null }
+  | { type: 'list.deleted'; listId: string; date: string | null }
+  | { type: 'list.item.changed'; listId: string };
 
 class FamilyBus {
   private emitters = new Map<string, EventEmitter>();
