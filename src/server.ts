@@ -78,6 +78,17 @@ async function main() {
       prefix: '/',
       wildcard: false,
     });
+    // Client-side React routes (e.g. /desktop/3, /admin/chores, /privacy)
+    // must all serve the SPA shell on direct refresh. We register an
+    // explicit catch-all instead of relying only on setNotFoundHandler because
+    // static middleware/host adapters can otherwise turn deep links into a
+    // platform 404 before the SPA gets a chance to boot.
+    app.get('/*', async (req, reply) => {
+      if (req.url.startsWith('/api/') || req.url.startsWith('/.well-known/')) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+      return reply.sendFile('index.html');
+    });
     app.setNotFoundHandler(async (req, reply) => {
       // Don't fallthrough to index.html for /api/* or /.well-known/* —
       // those should 404 cleanly so misconfigured clients see a real error.
