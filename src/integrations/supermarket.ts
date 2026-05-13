@@ -101,6 +101,27 @@ function toCents(dollars: number | null): number | null {
   return Math.round(dollars * 100);
 }
 
+function normaliseImageUrl(raw: string | null, externalId: string): string | null {
+  if (raw) {
+    const value = raw.trim();
+    const lower = value.toLowerCase();
+    // The RapidAPI response includes a Woolworths product page `URL`; that is
+    // not an image and breaks <img>. Only accept actual image-like URLs here.
+    if (/\.(png|jpe?g|webp)(\?|$)/i.test(value) || lower.includes('wowproductimages')) {
+      if (value.startsWith('//')) return `https:${value}`;
+      if (value.startsWith('/')) return `https://www.woolworths.com.au${value}`;
+      return value.replace(/^http:\/\//i, 'https://');
+    }
+  }
+
+  // Woolworths product images are keyed by stockcode on their CDN. Search
+  // results usually include Stockcode, even when no image field is returned.
+  if (/^\d{3,8}$/.test(externalId)) {
+    return `https://cdn0.woolworths.media/content/wowproductimages/large/${externalId}.jpg`;
+  }
+  return null;
+}
+
 /**
  * Map a single upstream product (whichever shape RapidAPI hands us) onto our
  * normalised `ProductCard`. We look at every plausible alias for each field,
@@ -126,7 +147,7 @@ export function normaliseProduct(raw: unknown): ProductCard | null {
   if (!externalId || !name) return null;
 
   const brand = pickString(o, 'Brand', 'brand', 'Product Brand', 'manufacturer');
-  const image = pickString(
+  const rawImage = pickString(
     o,
     'LargeImageFile',
     'MediumImageFile',
@@ -140,6 +161,7 @@ export function normaliseProduct(raw: unknown): ProductCard | null {
     'Product Image',
     'Image URL',
   );
+  const image = normaliseImageUrl(rawImage, externalId);
   const packageSize = pickString(
     o,
     'PackageSize',
