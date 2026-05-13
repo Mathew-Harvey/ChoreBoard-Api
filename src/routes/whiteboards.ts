@@ -199,10 +199,22 @@ export async function whiteboardRoutes(app: FastifyInstance): Promise<void> {
     return { whiteboard: row };
   });
 
-  // DELETE /whiteboards/:id — only parents can remove a board outright.
+  // DELETE /whiteboards/:id — parents can remove any board; kids/parents can
+  // remove boards they created.
   app.delete('/whiteboards/:id', async (req, reply) => {
-    const p = req.requireParent();
+    const p = req.requireAnyMember();
     const params = z.object({ id: z.string().uuid() }).parse(req.params);
+    const [existing] = await db
+      .select()
+      .from(whiteboards)
+      .where(and(eq(whiteboards.id, params.id), eq(whiteboards.familyId, p.familyId)))
+      .limit(1);
+    if (!existing) return reply.code(404).send({ error: 'not_found' });
+    const ownsBoard =
+      p.kind === 'parent'
+        ? existing.createdByUserId === p.userId
+        : existing.createdByKidId === p.kidId;
+    if (p.kind !== 'parent' && !ownsBoard) return reply.code(403).send({ error: 'not_yours' });
     const [row] = await db
       .delete(whiteboards)
       .where(and(eq(whiteboards.id, params.id), eq(whiteboards.familyId, p.familyId)))

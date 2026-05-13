@@ -178,10 +178,22 @@ export async function listsRoutes(app: FastifyInstance): Promise<void> {
     return { list: row };
   });
 
-  // DELETE /lists/:id — parent-only (kids can archive instead).
+  // DELETE /lists/:id — parents can remove any list; kids/parents can remove
+  // lists they created.
   app.delete('/lists/:id', async (req, reply) => {
-    const p = req.requireParent();
+    const p = req.requireAnyMember();
     const params = z.object({ id: z.string().uuid() }).parse(req.params);
+    const [existing] = await db
+      .select()
+      .from(lists)
+      .where(and(eq(lists.id, params.id), eq(lists.familyId, p.familyId)))
+      .limit(1);
+    if (!existing) return reply.code(404).send({ error: 'not_found' });
+    const ownsList =
+      p.kind === 'parent'
+        ? existing.createdByUserId === p.userId
+        : existing.createdByKidId === p.kidId;
+    if (p.kind !== 'parent' && !ownsList) return reply.code(403).send({ error: 'not_yours' });
     const [row] = await db
       .delete(lists)
       .where(and(eq(lists.id, params.id), eq(lists.familyId, p.familyId)))
