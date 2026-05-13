@@ -1,15 +1,18 @@
 import type { FastifyInstance } from 'fastify';
+import { config } from '../config.js';
 import { bus, type FamilyEvent } from '../realtime/bus.js';
 
 export async function sseRoutes(app: FastifyInstance): Promise<void> {
   app.get('/events', async (req, reply) => {
     const p = req.requireAnyMember();
+    const corsHeaders = sseCorsHeaders(req.headers.origin);
     reply.hijack();
     reply.raw.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache, no-transform',
       Connection: 'keep-alive',
       'X-Accel-Buffering': 'no',
+      ...corsHeaders,
     });
     // Initial hello so the client knows we're connected.
     reply.raw.write(`event: hello\ndata: {"familyId":"${p.familyId}"}\n\n`);
@@ -36,4 +39,22 @@ export async function sseRoutes(app: FastifyInstance): Promise<void> {
 
     // We've hijacked the reply; this handler resolves but the socket stays open.
   });
+}
+
+function sseCorsHeaders(origin: string | undefined): Record<string, string> {
+  if (!origin) return {};
+  const allowAny = config.webOrigin === '*';
+  const allowed = allowAny
+    ? true
+    : config.webOrigin
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .includes(origin);
+  if (!allowed) return {};
+  return {
+    'Access-Control-Allow-Origin': allowAny ? origin : origin,
+    'Access-Control-Allow-Credentials': 'true',
+    Vary: 'Origin',
+  };
 }

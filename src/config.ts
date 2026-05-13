@@ -21,7 +21,10 @@ export const config = {
   // Comma-separated list of allowed CORS origins. Includes Capacitor's
   // schemes (capacitor://localhost, https://localhost) so the iOS / Android
   // shells can call api.choreboard.io.
-  webOrigin: optional('WEB_ORIGIN', 'http://localhost:5173'),
+  webOrigin: optional(
+    'WEB_ORIGIN',
+    'http://localhost:5173,https://app.choreboard.io,capacitor://localhost,https://localhost',
+  ),
   webDistDir: process.env.WEB_DIST_DIR,
   // Optional cookie domain. Set to ".choreboard.io" in prod so a session
   // issued on app.choreboard.io is sent on calls to api.choreboard.io.
