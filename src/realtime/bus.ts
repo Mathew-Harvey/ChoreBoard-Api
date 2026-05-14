@@ -27,7 +27,17 @@ export type FamilyEvent =
   | { type: 'list.created'; listId: string; date: string | null }
   | { type: 'list.updated'; listId: string; date: string | null }
   | { type: 'list.deleted'; listId: string; date: string | null }
-  | { type: 'list.item.changed'; listId: string };
+  | { type: 'list.item.changed'; listId: string }
+  | {
+      type: 'milestone.hit';
+      milestoneId: string;
+      hitId: string;
+      scope: 'family' | 'member';
+      memberType: 'user' | 'kid' | null;
+      memberId: string | null;
+    }
+  | { type: 'milestone.updated'; milestoneId: string }
+  | { type: 'milestone.claimed'; milestoneId: string; hitId: string };
 
 class FamilyBus {
   private emitters = new Map<string, EventEmitter>();

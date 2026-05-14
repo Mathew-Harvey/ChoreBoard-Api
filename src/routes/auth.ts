@@ -1,8 +1,8 @@
 import type { FastifyInstance } from 'fastify';
-import { and, eq } from 'drizzle-orm';
+import { and, eq, gt, isNull } from 'drizzle-orm';
 import { z } from 'zod';
 import { db } from '../db/client.js';
-import { families, kids, users, chores, sessions } from '../db/schema.js';
+import { familyInvites, families, kids, users, chores, sessions } from '../db/schema.js';
 import { hashPassword, verifyPassword, verifyPin } from '../auth/password.js';
 import {
   endSession,
@@ -158,6 +158,120 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     return { ok: true };
   });
 
+  // ----- Co-parent invites: public lookup + accept ------------------------
+  //
+  // The owner-side of this flow (create / revoke) lives in /family/invites.
+  // The two endpoints below are deliberately *unauthenticated* — the bearer
+  // of the URL is the principal — so a new parent who doesn't yet have a
+  // ChoreBoard account can preview the invite and then join.
+
+  // Look up an invite by token. Returns a small public projection so the
+  // join screen can render "Join the Smith family — invited by Sam".
+  // Doesn't reveal anything else about the family (e.g. kid names) before
+  // the joiner commits.
+  app.get('/auth/invites/:token', async (req, reply) => {
+    const params = z.object({ token: z.string().min(8).max(128) }).parse(req.params);
+    const result = await lookupInvite(params.token);
+    if (result.kind !== 'ok') {
+      return reply.code(result.kind === 'not_found' ? 404 : 410).send({ error: result.kind });
+    }
+    return {
+      invite: {
+        familyName: result.familyName,
+        invitedByName: result.invitedByName,
+        expiresAt: result.invite.expiresAt.toISOString(),
+      },
+    };
+  });
+
+  // Accept an invite and create the second parent. Mirrors signup's shape
+  // (returns `{ user, family, session }`) so the SPA can hand off to the
+  // dashboard the same way it does after signup/login.
+  app.post('/auth/invites/:token/accept', async (req, reply) => {
+    const params = z.object({ token: z.string().min(8).max(128) }).parse(req.params);
+    const body = z
+      .object({
+        email: z.string().email(),
+        password: z.string().min(8),
+        name: z.string().min(1).max(64),
+      })
+      .parse(req.body);
+
+    const result = await lookupInvite(params.token);
+    if (result.kind !== 'ok') {
+      return reply.code(result.kind === 'not_found' ? 404 : 410).send({ error: result.kind });
+    }
+
+    const existing = await db
+      .select({ id: users.id })
+      .from(users)
+      .where(eq(users.email, body.email))
+      .limit(1);
+    if (existing.length > 0) {
+      return reply.code(409).send({ error: 'email_taken' });
+    }
+
+    const passwordHash = await hashPassword(body.password);
+    let accepted: { newUser: typeof users.$inferSelect };
+    try {
+      accepted = await db.transaction(async (tx) => {
+        const now = new Date();
+        const [claimedInvite] = await tx
+          .update(familyInvites)
+          .set({ consumedAt: now })
+          .where(
+            and(
+              eq(familyInvites.id, result.invite.id),
+              isNull(familyInvites.consumedAt),
+              isNull(familyInvites.revokedAt),
+              gt(familyInvites.expiresAt, now),
+            ),
+          )
+          .returning();
+        if (!claimedInvite) {
+          throw new InviteAcceptError(410, 'invite_consumed');
+        }
+
+        const [newUser] = await tx
+          .insert(users)
+          .values({
+            familyId: claimedInvite.familyId,
+            email: body.email,
+            passwordHash,
+            name: body.name,
+            role: 'parent',
+          })
+          .returning();
+
+        await tx
+          .update(familyInvites)
+          .set({ consumedByUserId: newUser!.id })
+          .where(eq(familyInvites.id, claimedInvite.id));
+
+        return { newUser: newUser! };
+      });
+    } catch (e) {
+      if (e instanceof InviteAcceptError) {
+        return reply.code(e.status).send({ error: e.code });
+      }
+      throw e;
+    }
+
+    const session = await startParentSession(
+      reply,
+      accepted.newUser.id,
+      accepted.newUser.familyId,
+      pickTransport(req),
+    );
+    bus.publish(accepted.newUser.familyId, { type: 'family.updated' });
+
+    return {
+      user: publicUser(accepted.newUser),
+      family: { id: result.invite.familyId, name: result.familyName },
+      session,
+    };
+  });
+
   // ----- Owner: delete entire family --------------------------------------
   // Both the App Store and Play Store require an in-app account deletion
   // path. For an owner, "delete my account" semantically means "delete the
@@ -204,4 +318,58 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
 
 function publicUser(u: typeof users.$inferSelect) {
   return { id: u.id, email: u.email, name: u.name, role: u.role, familyId: u.familyId };
+}
+
+class InviteAcceptError extends Error {
+  constructor(
+    public status: number,
+    public code: string,
+  ) {
+    super(code);
+  }
+}
+
+// Resolve an invite token to the family + inviter context, or a typed
+// reason it isn't usable. Centralised so GET and POST share one code path.
+type InviteLookup =
+  | {
+      kind: 'ok';
+      invite: typeof familyInvites.$inferSelect;
+      familyName: string;
+      invitedByName: string | null;
+    }
+  | { kind: 'not_found' }
+  | { kind: 'invite_consumed' }
+  | { kind: 'invite_revoked' }
+  | { kind: 'invite_expired' };
+
+async function lookupInvite(token: string): Promise<InviteLookup> {
+  const [row] = await db
+    .select()
+    .from(familyInvites)
+    .where(eq(familyInvites.token, token))
+    .limit(1);
+  if (!row) return { kind: 'not_found' };
+  if (row.consumedAt) return { kind: 'invite_consumed' };
+  if (row.revokedAt) return { kind: 'invite_revoked' };
+  if (row.expiresAt.getTime() <= Date.now()) return { kind: 'invite_expired' };
+
+  const [fam] = await db
+    .select({ id: families.id, name: families.name })
+    .from(families)
+    .where(eq(families.id, row.familyId))
+    .limit(1);
+  if (!fam) return { kind: 'not_found' };
+
+  let invitedByName: string | null = null;
+  if (row.createdByUserId) {
+    const [u] = await db
+      .select({ name: users.name })
+      .from(users)
+      .where(eq(users.id, row.createdByUserId))
+      .limit(1);
+    invitedByName = u?.name ?? null;
+  }
+
+  return { kind: 'ok', invite: row, familyName: fam.name, invitedByName };
 }

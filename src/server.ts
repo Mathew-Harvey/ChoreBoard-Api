@@ -12,6 +12,7 @@ import { boardRoutes } from './routes/board.js';
 import { statsRoutes } from './routes/stats.js';
 import { ledgerRoutes } from './routes/ledger.js';
 import { goalsRoutes } from './routes/goals.js';
+import { milestonesRoutes } from './routes/milestones.js';
 import { sseRoutes } from './routes/sse.js';
 import { devicesRoutes } from './routes/devices.js';
 import { billingRoutes } from './routes/billing.js';
@@ -60,6 +61,7 @@ async function main() {
       await api.register(statsRoutes);
       await api.register(ledgerRoutes);
       await api.register(goalsRoutes);
+      await api.register(milestonesRoutes);
       await api.register(sseRoutes);
       await api.register(devicesRoutes);
       await api.register(billingRoutes);

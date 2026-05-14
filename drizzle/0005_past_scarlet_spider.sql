@@ -1,0 +1,1 @@
+ALTER TABLE "product_cache" ADD COLUMN "product_url" text;

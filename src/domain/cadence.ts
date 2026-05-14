@@ -280,3 +280,9 @@ export function startOfLocalDay(d: Date, timezone: string): Date {
   const p = partsInZone(d, timezone);
   return zonedDateToUtc(p.year, p.month, p.day, 0, 0, timezone);
 }
+
+/** Midnight on the 1st of `d`'s local month, in the given IANA timezone. */
+export function startOfLocalMonth(d: Date, timezone: string): Date {
+  const p = partsInZone(d, timezone);
+  return zonedDateToUtc(p.year, p.month, 1, 0, 0, timezone);
+}

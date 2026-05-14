@@ -31,6 +31,7 @@ const productSnapshotSchema = z
     priceCents: z.number().int().nullable().optional(),
     wasPriceCents: z.number().int().nullable().optional(),
     onSpecial: z.boolean().optional(),
+    productUrl: z.string().nullable().optional(),
   })
   .nullable();
 

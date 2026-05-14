@@ -17,6 +17,7 @@ import {
   evaluateGoals,
   recordXp,
 } from '../domain/gamification.js';
+import { evaluateMilestones } from '../domain/milestones.js';
 import { nextOccurrenceAfter, startOfLocalDay, type Cadence } from '../domain/cadence.js';
 import { memberBelongsToFamily } from '../domain/membership.js';
 
@@ -515,6 +516,16 @@ async function approveLoadedInstance(
     timezone: fam.timezone,
     payoutDay: fam.payoutDay,
     payoutTime: fam.payoutTime,
+  });
+  await evaluateMilestones(tx, {
+    familyId: fam.id,
+    member,
+    family: {
+      timezone: fam.timezone,
+      payoutDay: fam.payoutDay,
+      payoutTime: fam.payoutTime,
+    },
+    now: approvedAt,
   });
 
   return { instance: updated };

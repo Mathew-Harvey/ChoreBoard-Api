@@ -81,6 +81,42 @@ export const kids = pgTable(
   }),
 );
 
+// Owner-generated invites that let a second (or third, …) parent join an
+// existing family. The flow is intentionally email-free: the owner copies
+// the join URL out of the admin UI and shares it however they want (SMS,
+// Signal, etc.), which dodges the dependency on transactional email infra
+// for v1.
+//
+// One row per *generated* invite. A row is "active" iff
+//   consumedAt IS NULL AND revokedAt IS NULL AND expiresAt > now()
+// `token` is the URL-safe secret embedded in the join link; we never log it.
+export const familyInvites = pgTable(
+  'family_invites',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    familyId: uuid('family_id')
+      .notNull()
+      .references(() => families.id, { onDelete: 'cascade' }),
+    token: text('token').notNull(),
+    // Owner who generated the invite. Nullable so removing a parent (set null
+    // on delete) doesn't blow away their historical invites.
+    createdByUserId: uuid('created_by_user_id').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+    consumedAt: timestamp('consumed_at', { withTimezone: true }),
+    consumedByUserId: uuid('consumed_by_user_id').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    revokedAt: timestamp('revoked_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    tokenUniq: uniqueIndex('family_invites_token_uniq').on(t.token),
+    familyIdx: index('family_invites_family_idx').on(t.familyId),
+  }),
+);
+
 // ----------------------------------------------------------------------------
 // Chores & instances
 // ----------------------------------------------------------------------------
@@ -561,12 +597,120 @@ export const productCache = pgTable(
     priceCents: integer('price_cents'),
     wasPriceCents: integer('was_price_cents'),
     onSpecial: boolean('on_special').notNull().default(false),
+    // Deep link to the upstream product detail page. Cached so the list
+    // editor can render "Buy on Woolworths" affordances without re-fetching.
+    productUrl: text('product_url'),
     payloadJson: jsonb('payload_json'),
     cachedAt: timestamp('cached_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => ({
     sourceExtUniq: uniqueIndex('product_cache_source_ext_uniq').on(t.source, t.externalId),
     nameIdx: index('product_cache_name_idx').on(t.source, t.name),
+  }),
+);
+
+// ----------------------------------------------------------------------------
+// Milestones & rewards
+// ----------------------------------------------------------------------------
+// A *milestone* is a parent-defined target ("hit $50 as a family this week",
+// "Skye does 20 chores this month", "the family earns $1000 lifetime") paired
+// with a custom reward the parent commits to honouring ("pizza night out",
+// "trip to the zoo"). Milestones are richer than `goals`:
+//
+//  - they can be scoped to the *whole family* or to a single member,
+//  - they can measure either dollars or chore counts,
+//  - they can repeat each week/month and reset automatically,
+//  - they carry a reward description + emoji, not just a $ target,
+//  - each individual time a recurring milestone is hit is stored in
+//    `milestone_hits` so the parent has a permanent record of which weekly
+//    rewards have been delivered and which are still outstanding.
+//
+// Evaluation runs at chore-approval time (see `domain/milestones.ts`),
+// piggy-backing on the same transaction as the ledger insert. Recurring
+// milestones use `period_start` (the family-TZ start of the current week or
+// month, or the unix epoch for lifetime) as the bucket key so we can write
+// at most one `milestone_hits` row per (milestone, period).
+
+export const milestoneScopeEnum = pgEnum('milestone_scope', ['family', 'member']);
+export const milestoneMetricEnum = pgEnum('milestone_metric', [
+  'cents_earned',
+  'chores_completed',
+]);
+export const milestonePeriodEnum = pgEnum('milestone_period', [
+  'week',
+  'month',
+  'lifetime',
+]);
+
+export const milestones = pgTable(
+  'milestones',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    familyId: uuid('family_id')
+      .notNull()
+      .references(() => families.id, { onDelete: 'cascade' }),
+    name: text('name').notNull(), // "Pizza night week"
+    reward: text('reward').notNull(), // "Pizza night out as a family"
+    icon: text('icon'), // optional emoji, e.g. "🍕"
+    scope: milestoneScopeEnum('scope').notNull().default('family'),
+    // memberType + memberId are non-null iff scope = 'member'.
+    memberType: memberTypeEnum('member_type'),
+    memberId: uuid('member_id'),
+    metric: milestoneMetricEnum('metric').notNull().default('cents_earned'),
+    period: milestonePeriodEnum('period').notNull().default('week'),
+    // Cents when metric=cents_earned; raw count when metric=chores_completed.
+    targetValue: integer('target_value').notNull(),
+    // If true, the milestone resets at every period boundary and can be hit
+    // again. If false, it fires once and goes inactive automatically.
+    repeats: boolean('repeats').notNull().default(true),
+    active: boolean('active').notNull().default(true),
+    createdByUserId: uuid('created_by_user_id'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+    archivedAt: timestamp('archived_at', { withTimezone: true }),
+  },
+  (t) => ({
+    familyIdx: index('milestones_family_idx').on(t.familyId),
+    activeIdx: index('milestones_family_active_idx').on(t.familyId, t.active),
+  }),
+);
+
+// One row per *time* a milestone is hit. For a non-repeating lifetime
+// milestone there's only ever one row. For a repeating weekly milestone
+// there'll be one per week the family ever crossed the line.
+//
+// `period_start` is the canonical bucket key — for `week` it's the family
+// payout cutoff (start of the current week), for `month` it's midnight on
+// the 1st in the family timezone, for `lifetime` it's the unix epoch. The
+// (milestone_id, period_start) unique index keeps evaluation idempotent: the
+// approver-side handler can call `evaluateMilestones` after every chore
+// approval without worrying about double-firing.
+export const milestoneHits = pgTable(
+  'milestone_hits',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    familyId: uuid('family_id')
+      .notNull()
+      .references(() => families.id, { onDelete: 'cascade' }),
+    milestoneId: uuid('milestone_id')
+      .notNull()
+      .references(() => milestones.id, { onDelete: 'cascade' }),
+    periodStart: timestamp('period_start', { withTimezone: true }).notNull(),
+    hitAt: timestamp('hit_at', { withTimezone: true }).notNull().defaultNow(),
+    // Snapshot of the metric at the time of the hit (cents or count). Lets
+    // the dashboard show "you blew past it by $12" without recomputing.
+    amount: integer('amount').notNull(),
+    claimedAt: timestamp('claimed_at', { withTimezone: true }),
+    claimedByUserId: uuid('claimed_by_user_id'),
+    claimNote: text('claim_note'),
+  },
+  (t) => ({
+    familyIdx: index('milestone_hits_family_idx').on(t.familyId),
+    milestoneIdx: index('milestone_hits_milestone_idx').on(t.milestoneId),
+    bucketUniq: uniqueIndex('milestone_hits_bucket_uniq').on(
+      t.milestoneId,
+      t.periodStart,
+    ),
   }),
 );
 
