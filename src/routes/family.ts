@@ -230,6 +230,38 @@ export async function familyRoutes(app: FastifyInstance): Promise<void> {
 
   // Parents ----------------------------------------------------------------
   //
+  // Owner can promote a co-parent to co-owner. Multiple owners per family is
+  // supported — every owner-gated route just checks `role === 'owner'`, so
+  // granting the role gives the target full admin rights (billing, invites,
+  // parent removal, delete-family). There's no "demote" inverse in v1 — if
+  // you need to step a co-owner back down, you have to remove and re-invite.
+  app.post('/family/parents/:userId/promote', async (req, reply) => {
+    const p = req.requireParent();
+    if (p.role !== 'owner') {
+      return reply.code(403).send({ error: 'owner_only' });
+    }
+    const params = z.object({ userId: z.string().uuid() }).parse(req.params);
+    if (params.userId === p.userId) {
+      return reply.code(409).send({ error: 'already_owner' });
+    }
+
+    const [target] = await db
+      .select({ id: users.id, familyId: users.familyId, role: users.role })
+      .from(users)
+      .where(eq(users.id, params.userId))
+      .limit(1);
+    if (!target || target.familyId !== p.familyId) {
+      return reply.code(404).send({ error: 'not_found' });
+    }
+    if (target.role === 'owner') {
+      return reply.code(409).send({ error: 'already_owner' });
+    }
+
+    await db.update(users).set({ role: 'owner' }).where(eq(users.id, target.id));
+    bus.publish(p.familyId, { type: 'family.updated' });
+    return { ok: true };
+  });
+
   // Owner can remove a co-parent. This deletes the user row (cascading
   // their sessions, push subs, device tokens) but leaves their historical
   // chore approvals / ledger writes intact — those columns aren't FKs.
