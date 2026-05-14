@@ -20,6 +20,7 @@ import { whiteboardRoutes } from './routes/whiteboards.js';
 import { listsRoutes } from './routes/lists.js';
 import { productsRoutes } from './routes/products.js';
 import { wellKnownRoutes } from './routes/wellKnown.js';
+import { adminDashStatsRoutes } from './routes/adminDashStats.js';
 import { scheduler } from './scheduler/runner.js';
 import { ensureBadgeCatalogSeeded } from './domain/gamification.js';
 
@@ -68,6 +69,7 @@ async function main() {
       await api.register(whiteboardRoutes);
       await api.register(listsRoutes);
       await api.register(productsRoutes);
+      await api.register(adminDashStatsRoutes);
     },
     { prefix: '/api' },
   );
