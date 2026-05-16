@@ -12,6 +12,25 @@ import {
 
 type SqlFragment = ReturnType<typeof sql>;
 
+// `db.execute(sql\`...\`)` returns raw `pg` rows without the type coercion
+// that drizzle's typed `select()` does. The generic on `db.execute<T>()` is
+// purely a TypeScript hint, so timestamptz columns can land here as either
+// `Date` instances or ISO strings depending on the driver's type parser
+// state (e.g. pg-bouncer/transaction pooling can leave OID parsers unset).
+// These helpers normalise the value before formatting so the route never
+// crashes with "toISOString is not a function".
+function toIso(value: Date | string | number): string {
+  return value instanceof Date
+    ? value.toISOString()
+    : new Date(value).toISOString();
+}
+
+function toIsoNullable(
+  value: Date | string | number | null | undefined,
+): string | null {
+  return value == null ? null : toIso(value);
+}
+
 /**
  * History dashboard endpoint.
  *
@@ -341,12 +360,12 @@ export async function historyStatsRoutes(app: FastifyInstance): Promise<void> {
     //    "history" page lists their personal weekly take.
     const weekRows = await db.execute<{
       id: string;
-      starts_at: Date;
-      ends_at: Date;
-      closed_at: Date | null;
+      starts_at: Date | string;
+      ends_at: Date | string;
+      closed_at: Date | string | null;
       champion_member_type: 'user' | 'kid' | null;
       champion_member_id: string | null;
-      champion_amount_cents: number | null;
+      champion_amount_cents: number | string | null;
       total_cents: string;
       chore_count: string;
     }>(sql`
@@ -389,12 +408,15 @@ export async function historyStatsRoutes(app: FastifyInstance): Promise<void> {
       const championMeta = championKey ? roster.get(championKey) : undefined;
       return {
         id: w.id,
-        startsAt: w.starts_at.toISOString(),
-        endsAt: w.ends_at.toISOString(),
-        closedAt: w.closed_at ? w.closed_at.toISOString() : null,
+        startsAt: toIso(w.starts_at),
+        endsAt: toIso(w.ends_at),
+        closedAt: toIsoNullable(w.closed_at),
         championMemberType: w.champion_member_type,
         championMemberId: w.champion_member_id,
-        championAmountCents: w.champion_amount_cents,
+        championAmountCents:
+          w.champion_amount_cents == null
+            ? null
+            : Number(w.champion_amount_cents),
         championName: championMeta?.name ?? null,
         championColor: championMeta?.color ?? null,
         totalCents: Number(w.total_cents),
@@ -432,8 +454,8 @@ export async function historyStatsRoutes(app: FastifyInstance): Promise<void> {
 
     const biggestRow = await db.execute<{
       id: string;
-      amount_cents: number;
-      earned_at: Date;
+      amount_cents: number | string;
+      earned_at: Date | string;
       member_type: 'user' | 'kid';
       member_id: string;
       chore_id: string;
@@ -467,8 +489,8 @@ export async function historyStatsRoutes(app: FastifyInstance): Promise<void> {
             memberId: big.member_id,
             memberName: meta?.name ?? 'Removed member',
             memberColor: meta?.color ?? null,
-            cents: big.amount_cents,
-            earnedAt: big.earned_at.toISOString(),
+            cents: Number(big.amount_cents),
+            earnedAt: toIso(big.earned_at),
           };
         })()
       : null;
