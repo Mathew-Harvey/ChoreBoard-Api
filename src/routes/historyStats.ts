@@ -80,9 +80,10 @@ export async function historyStatsRoutes(app: FastifyInstance): Promise<void> {
       .where(eq(families.id, p.familyId))
       .limit(1);
     if (!fam) return reply.code(404).send({ error: 'family_not_found' });
+    const timezone = validTimezone(fam.timezone) ? fam.timezone : 'UTC';
 
     const now = new Date();
-    const range = resolveRange(q, fam, now);
+    const range = resolveRange(q, fam, now, timezone);
     const rangeMs = range.to.getTime() - range.from.getTime();
 
     // Previous-period comparison: equal-length window immediately before
@@ -152,7 +153,7 @@ export async function historyStatsRoutes(app: FastifyInstance): Promise<void> {
     }>(sql`
       with bucketed as (
         select
-          to_char(earned_at at time zone ${fam.timezone}, 'YYYY-MM-DD') as day,
+          to_char(earned_at at time zone ${timezone}, 'YYYY-MM-DD') as day,
           amount_cents,
           member_type,
           member_id
@@ -176,7 +177,7 @@ export async function historyStatsRoutes(app: FastifyInstance): Promise<void> {
       select
         coalesce(sum(amount_cents), 0)::text as cents,
         count(*)::text as chores,
-        count(distinct member_type::text || ':' || member_id::text)::text as active_members,
+        count(distinct concat(member_type::text, ':', member_id::text))::text as active_members,
         (select day from best) as best_day,
         (select cents::text from best) as best_day_cents,
         (select chores::text from best) as best_day_chores
@@ -198,7 +199,7 @@ export async function historyStatsRoutes(app: FastifyInstance): Promise<void> {
     //    so the chart axis stays even). Capped to ~370 days for memory.
     const daily = await fetchDailyDense(
       p.familyId,
-      fam.timezone,
+      timezone,
       range.from,
       range.to,
       memberFrag,
@@ -209,7 +210,7 @@ export async function historyStatsRoutes(app: FastifyInstance): Promise<void> {
     const previousDaily = previousRange
       ? await fetchDailyDense(
           p.familyId,
-          fam.timezone,
+          timezone,
           previousRange.from,
           previousRange.to,
           memberFrag,
@@ -221,7 +222,7 @@ export async function historyStatsRoutes(app: FastifyInstance): Promise<void> {
     //    the rest of the codebase's weekday convention.
     const dowRows = await db.execute<{ dow: string; cents: string; chores: string }>(sql`
       select
-        extract(dow from earned_at at time zone ${fam.timezone})::int::text as dow,
+        extract(dow from earned_at at time zone ${timezone})::int::text as dow,
         sum(amount_cents)::text as cents,
         count(*)::text as chores
       from ledger_entries
@@ -320,7 +321,7 @@ export async function historyStatsRoutes(app: FastifyInstance): Promise<void> {
       select status::text as status, count(*)::text as n
       from chore_instances
       where family_id = ${p.familyId}
-        and status in ('approved', 'missed', 'rejected')
+        and status::text in ('approved', 'missed', 'rejected')
         and coalesce(approved_at, completed_at, due_at, available_at) >= ${range.from}
         and coalesce(approved_at, completed_at, due_at, available_at) < ${range.to}
         ${memberFilter
@@ -369,7 +370,14 @@ export async function historyStatsRoutes(app: FastifyInstance): Promise<void> {
       where w.family_id = ${p.familyId}
         and w.starts_at < ${range.to}
         and w.ends_at >= ${range.from}
-      group by w.id
+      group by
+        w.id,
+        w.starts_at,
+        w.ends_at,
+        w.closed_at,
+        w.champion_member_type,
+        w.champion_member_id,
+        w.champion_amount_cents
       order by w.starts_at desc
       limit 26
     `);
@@ -579,9 +587,10 @@ export async function historyStatsRoutes(app: FastifyInstance): Promise<void> {
       .where(eq(families.id, p.familyId))
       .limit(1);
     if (!fam) return reply.code(404).send({ error: 'family_not_found' });
+    const timezone = validTimezone(fam.timezone) ? fam.timezone : 'UTC';
 
     const now = new Date();
-    const range = resolveRange(q, fam, now);
+    const range = resolveRange(q, fam, now, timezone);
     const memberFrag =
       q.memberType && q.memberId
         ? sql`and member_type = ${q.memberType} and member_id = ${q.memberId}`
@@ -589,7 +598,7 @@ export async function historyStatsRoutes(app: FastifyInstance): Promise<void> {
 
     const daily = await fetchDailyDense(
       p.familyId,
-      fam.timezone,
+      timezone,
       range.from,
       range.to,
       memberFrag,
@@ -656,20 +665,26 @@ function resolveRange(
   q: z.infer<typeof querySchema>,
   fam: Family,
   now: Date,
+  timezone = fam.timezone,
 ): ResolvedRange {
   if (q.preset) {
-    return rangeForPreset(q.preset, fam, now);
+    return rangeForPreset(q.preset, fam, now, timezone);
   }
   if (q.from || q.to) {
-    const from = q.from ? new Date(q.from) : startOfLocalMonth(now, fam.timezone);
+    const from = q.from ? new Date(q.from) : startOfLocalMonth(now, timezone);
     const to = q.to ? new Date(q.to) : now;
     return { from, to, label: 'Custom range', preset: 'custom' };
   }
-  return rangeForPreset('this_month', fam, now);
+  return rangeForPreset('this_month', fam, now, timezone);
 }
 
-function rangeForPreset(preset: Preset, fam: Family, now: Date): ResolvedRange {
-  const tz = fam.timezone;
+function rangeForPreset(
+  preset: Preset,
+  fam: Family,
+  now: Date,
+  timezone = fam.timezone,
+): ResolvedRange {
+  const tz = timezone;
   switch (preset) {
     case 'this_week': {
       const from = lastPayoutMoment(now, tz, fam.payoutDay, fam.payoutTime);
@@ -776,6 +791,15 @@ function localYear(d: Date, timezone: string): number {
       year: 'numeric',
     }).format(d),
   );
+}
+
+function validTimezone(timezone: string): boolean {
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: timezone }).format(new Date());
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // ---------------------------------------------------------------------------
