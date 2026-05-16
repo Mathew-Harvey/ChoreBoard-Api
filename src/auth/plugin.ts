@@ -6,6 +6,8 @@ import { kids, users } from '../db/schema.js';
 import { config, isProd } from '../config.js';
 import { createSession, deleteSession, getSession, type SessionRow } from './sessions.js';
 
+export type Gender = 'male' | 'female' | 'unspecified';
+
 export type ParentPrincipal = {
   kind: 'parent';
   userId: string;
@@ -13,6 +15,8 @@ export type ParentPrincipal = {
   role: 'owner' | 'parent';
   name: string;
   email: string;
+  color: string;
+  gender: Gender;
 };
 
 export type KidPrincipal = {
@@ -21,6 +25,7 @@ export type KidPrincipal = {
   familyId: string;
   name: string;
   color: string;
+  gender: Gender;
 };
 
 export type Principal = ParentPrincipal | KidPrincipal;
@@ -135,6 +140,8 @@ export const authPlugin = fp(async (app) => {
           role: u.role,
           name: u.name,
           email: u.email,
+          color: u.color,
+          gender: u.gender,
         };
       }
     } else if (session.kidId) {
@@ -146,6 +153,7 @@ export const authPlugin = fp(async (app) => {
           familyId: k.familyId,
           name: k.name,
           color: k.color,
+          gender: k.gender,
         };
       }
     }

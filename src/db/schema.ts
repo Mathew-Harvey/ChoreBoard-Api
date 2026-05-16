@@ -17,6 +17,10 @@ import {
 
 export const roleEnum = pgEnum('role', ['owner', 'parent']);
 export const memberTypeEnum = pgEnum('member_type', ['user', 'kid']);
+// Member-stated gender used to pick a portrait set in the gamification UI.
+// `unspecified` is the default and renders an alternating m/f portrait so a
+// "rather not say" member still gets a personal-feeling avatar.
+export const genderEnum = pgEnum('gender', ['male', 'female', 'unspecified']);
 export const instanceStatusEnum = pgEnum('instance_status', [
   'available',
   'claimed',
@@ -55,6 +59,8 @@ export const users = pgTable(
     name: text('name').notNull(),
     role: roleEnum('role').notNull().default('parent'),
     avatar: text('avatar'),
+    color: text('color').notNull().default('#3253D7'),
+    gender: genderEnum('gender').notNull().default('unspecified'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => ({
@@ -74,6 +80,7 @@ export const kids = pgTable(
     pinHash: text('pin_hash').notNull(),
     avatar: text('avatar'),
     color: text('color').notNull().default('#3B82F6'),
+    gender: genderEnum('gender').notNull().default('unspecified'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => ({

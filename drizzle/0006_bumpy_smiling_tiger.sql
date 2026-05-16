@@ -1,0 +1,1 @@
+ALTER TABLE "users" ADD COLUMN "color" text DEFAULT '#3253D7' NOT NULL;

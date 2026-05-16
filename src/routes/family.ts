@@ -36,11 +36,24 @@ export async function familyRoutes(app: FastifyInstance): Promise<void> {
     const p = req.requireAnyMember();
     const [fam] = await db.select().from(families).where(eq(families.id, p.familyId)).limit(1);
     const us = await db
-      .select({ id: users.id, name: users.name, role: users.role, avatar: users.avatar })
+      .select({
+        id: users.id,
+        name: users.name,
+        role: users.role,
+        avatar: users.avatar,
+        color: users.color,
+        gender: users.gender,
+      })
       .from(users)
       .where(eq(users.familyId, p.familyId));
     const ks = await db
-      .select({ id: kids.id, name: kids.name, color: kids.color, avatar: kids.avatar })
+      .select({
+        id: kids.id,
+        name: kids.name,
+        color: kids.color,
+        avatar: kids.avatar,
+        gender: kids.gender,
+      })
       .from(kids)
       .where(eq(kids.familyId, p.familyId));
     return { family: fam, parents: us, kids: ks };
@@ -85,6 +98,7 @@ export async function familyRoutes(app: FastifyInstance): Promise<void> {
         pin: z.string().regex(/^\d{4}$/),
         color: z.string().regex(/^#[0-9A-Fa-f]{6}$/).default('#3B82F6'),
         avatar: z.string().optional(),
+        gender: z.enum(['male', 'female', 'unspecified']).default('unspecified'),
       })
       .parse(req.body);
     const [k] = await db
@@ -95,11 +109,20 @@ export async function familyRoutes(app: FastifyInstance): Promise<void> {
         pinHash: await hashPin(body.pin),
         color: body.color,
         avatar: body.avatar,
+        gender: body.gender,
       })
       .returning();
     bus.publish(p.familyId, { type: 'family.updated' });
     reply.code(201);
-    return { kid: { id: k!.id, name: k!.name, color: k!.color, avatar: k!.avatar } };
+    return {
+      kid: {
+        id: k!.id,
+        name: k!.name,
+        color: k!.color,
+        avatar: k!.avatar,
+        gender: k!.gender,
+      },
+    };
   });
 
   app.patch('/family/kids/:id', async (req, reply) => {
@@ -111,12 +134,14 @@ export async function familyRoutes(app: FastifyInstance): Promise<void> {
         pin: z.string().regex(/^\d{4}$/).optional(),
         color: z.string().regex(/^#[0-9A-Fa-f]{6}$/).optional(),
         avatar: z.string().optional(),
+        gender: z.enum(['male', 'female', 'unspecified']).optional(),
       })
       .parse(req.body);
     const patch: Record<string, unknown> = {};
     if (body.name !== undefined) patch.name = body.name;
     if (body.color !== undefined) patch.color = body.color;
     if (body.avatar !== undefined) patch.avatar = body.avatar;
+    if (body.gender !== undefined) patch.gender = body.gender;
     if (body.pin !== undefined) patch.pinHash = await hashPin(body.pin);
     if (Object.keys(patch).length === 0) {
       return reply.code(400).send({ error: 'no_fields' });
@@ -128,7 +153,15 @@ export async function familyRoutes(app: FastifyInstance): Promise<void> {
       .returning();
     if (!k) return reply.code(404).send({ error: 'not_found' });
     bus.publish(p.familyId, { type: 'family.updated' });
-    return { kid: { id: k.id, name: k.name, color: k.color, avatar: k.avatar } };
+    return {
+      kid: {
+        id: k.id,
+        name: k.name,
+        color: k.color,
+        avatar: k.avatar,
+        gender: k.gender,
+      },
+    };
   });
 
   app.delete('/family/kids/:id', async (req) => {
@@ -230,6 +263,51 @@ export async function familyRoutes(app: FastifyInstance): Promise<void> {
 
   // Parents ----------------------------------------------------------------
   //
+  // Any parent can edit their own profile (name, color). Editing another
+  // parent's profile is also allowed for any parent — the family-admin model
+  // is "all parents trust each other"; same as how any parent can edit any
+  // kid. Role changes / removal stay owner-only via the dedicated endpoints
+  // below.
+  app.patch('/family/parents/:userId', async (req, reply) => {
+    const p = req.requireParent();
+    const params = z.object({ userId: z.string().uuid() }).parse(req.params);
+    const body = z
+      .object({
+        name: z.string().min(1).max(64).optional(),
+        color: z.string().regex(/^#[0-9A-Fa-f]{6}$/).optional(),
+        avatar: z.string().optional(),
+        gender: z.enum(['male', 'female', 'unspecified']).optional(),
+      })
+      .parse(req.body);
+    if (Object.keys(body).length === 0) {
+      return reply.code(400).send({ error: 'no_fields' });
+    }
+
+    const [target] = await db
+      .select({ id: users.id, familyId: users.familyId })
+      .from(users)
+      .where(eq(users.id, params.userId))
+      .limit(1);
+    if (!target || target.familyId !== p.familyId) {
+      return reply.code(404).send({ error: 'not_found' });
+    }
+
+    const [updated] = await db
+      .update(users)
+      .set(body)
+      .where(eq(users.id, target.id))
+      .returning({
+        id: users.id,
+        name: users.name,
+        role: users.role,
+        avatar: users.avatar,
+        color: users.color,
+        gender: users.gender,
+      });
+    bus.publish(p.familyId, { type: 'family.updated' });
+    return { parent: updated };
+  });
+
   // Owner can promote a co-parent to co-owner. Multiple owners per family is
   // supported — every owner-gated route just checks `role === 'owner'`, so
   // granting the role gives the target full admin rights (billing, invites,

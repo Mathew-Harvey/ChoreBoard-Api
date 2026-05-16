@@ -32,17 +32,53 @@ export async function statsRoutes(app: FastifyInstance): Promise<void> {
     `);
 
     const ks = await db
-      .select({ id: kids.id, name: kids.name, color: kids.color, avatar: kids.avatar })
+      .select({
+        id: kids.id,
+        name: kids.name,
+        color: kids.color,
+        avatar: kids.avatar,
+        gender: kids.gender,
+      })
       .from(kids)
       .where(eq(kids.familyId, p.familyId));
     const us = await db
-      .select({ id: users.id, name: users.name, avatar: users.avatar, role: users.role })
+      .select({
+        id: users.id,
+        name: users.name,
+        avatar: users.avatar,
+        role: users.role,
+        color: users.color,
+        gender: users.gender,
+      })
       .from(users)
       .where(eq(users.familyId, p.familyId));
 
-    const lookup = new Map<string, { name: string; color?: string; avatar?: string | null; kind: 'kid' | 'parent' }>();
-    ks.forEach((k) => lookup.set(`kid:${k.id}`, { name: k.name, color: k.color, avatar: k.avatar, kind: 'kid' }));
-    us.forEach((u) => lookup.set(`user:${u.id}`, { name: u.name, avatar: u.avatar, kind: 'parent' }));
+    type LookupRow = {
+      name: string;
+      color?: string;
+      avatar?: string | null;
+      gender: 'male' | 'female' | 'unspecified';
+      kind: 'kid' | 'parent';
+    };
+    const lookup = new Map<string, LookupRow>();
+    ks.forEach((k) =>
+      lookup.set(`kid:${k.id}`, {
+        name: k.name,
+        color: k.color,
+        avatar: k.avatar,
+        gender: k.gender,
+        kind: 'kid',
+      }),
+    );
+    us.forEach((u) =>
+      lookup.set(`user:${u.id}`, {
+        name: u.name,
+        color: u.color,
+        avatar: u.avatar,
+        gender: u.gender,
+        kind: 'parent',
+      }),
+    );
 
     const entries = rows.rows.map((r) => {
       const meta = lookup.get(`${r.member_type}:${r.member_id}`);
@@ -52,6 +88,7 @@ export async function statsRoutes(app: FastifyInstance): Promise<void> {
         name: meta?.name ?? 'Unknown',
         color: meta?.color,
         avatar: meta?.avatar ?? null,
+        gender: meta?.gender ?? 'unspecified',
         amountCents: Number(r.total),
         choreCount: Number(r.count),
       };

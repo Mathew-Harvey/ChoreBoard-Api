@@ -10,6 +10,7 @@ import { familyRoutes } from './routes/family.js';
 import { choreRoutes } from './routes/chores.js';
 import { boardRoutes } from './routes/board.js';
 import { statsRoutes } from './routes/stats.js';
+import { historyStatsRoutes } from './routes/historyStats.js';
 import { ledgerRoutes } from './routes/ledger.js';
 import { goalsRoutes } from './routes/goals.js';
 import { milestonesRoutes } from './routes/milestones.js';
@@ -60,6 +61,7 @@ async function main() {
       await api.register(choreRoutes);
       await api.register(boardRoutes);
       await api.register(statsRoutes);
+      await api.register(historyStatsRoutes);
       await api.register(ledgerRoutes);
       await api.register(goalsRoutes);
       await api.register(milestonesRoutes);

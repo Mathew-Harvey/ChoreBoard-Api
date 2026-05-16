@@ -24,6 +24,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         name: z.string().min(1).max(64),
         familyName: z.string().min(1).max(64),
         timezone: z.string().default('Australia/Sydney'),
+        gender: z.enum(['male', 'female', 'unspecified']).default('unspecified'),
       })
       .parse(req.body);
 
@@ -44,6 +45,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         passwordHash: await hashPassword(body.password),
         name: body.name,
         role: 'owner',
+        gender: body.gender,
       })
       .returning();
     await db
@@ -90,7 +92,13 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
   app.get('/auth/family/:familyId/kids', async (req, _reply) => {
     const params = z.object({ familyId: z.string().uuid() }).parse(req.params);
     const list = await db
-      .select({ id: kids.id, name: kids.name, color: kids.color, avatar: kids.avatar })
+      .select({
+        id: kids.id,
+        name: kids.name,
+        color: kids.color,
+        avatar: kids.avatar,
+        gender: kids.gender,
+      })
       .from(kids)
       .where(eq(kids.familyId, params.familyId));
     return { kids: list };
@@ -119,7 +127,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     if (!ok) return reply.code(401).send({ error: 'invalid_pin' });
     const session = await startKidSession(reply, k.id, k.familyId, pickTransport(req));
     return {
-      kid: { id: k.id, name: k.name, color: k.color, avatar: k.avatar },
+      kid: { id: k.id, name: k.name, color: k.color, avatar: k.avatar, gender: k.gender },
       session,
     };
   });
@@ -194,6 +202,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         email: z.string().email(),
         password: z.string().min(8),
         name: z.string().min(1).max(64),
+        gender: z.enum(['male', 'female', 'unspecified']).default('unspecified'),
       })
       .parse(req.body);
 
@@ -240,6 +249,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
             passwordHash,
             name: body.name,
             role: 'parent',
+            gender: body.gender,
           })
           .returning();
 
@@ -317,7 +327,15 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
 }
 
 function publicUser(u: typeof users.$inferSelect) {
-  return { id: u.id, email: u.email, name: u.name, role: u.role, familyId: u.familyId };
+  return {
+    id: u.id,
+    email: u.email,
+    name: u.name,
+    role: u.role,
+    familyId: u.familyId,
+    color: u.color,
+    gender: u.gender,
+  };
 }
 
 class InviteAcceptError extends Error {

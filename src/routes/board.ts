@@ -73,11 +73,24 @@ export async function boardRoutes(app: FastifyInstance): Promise<void> {
       .orderBy(asc(choreInstances.availableAt));
 
     const ks = await db
-      .select({ id: kids.id, name: kids.name, color: kids.color, avatar: kids.avatar })
+      .select({
+        id: kids.id,
+        name: kids.name,
+        color: kids.color,
+        avatar: kids.avatar,
+        gender: kids.gender,
+      })
       .from(kids)
       .where(eq(kids.familyId, p.familyId));
     const us = await db
-      .select({ id: users.id, name: users.name, role: users.role, avatar: users.avatar })
+      .select({
+        id: users.id,
+        name: users.name,
+        role: users.role,
+        avatar: users.avatar,
+        color: users.color,
+        gender: users.gender,
+      })
       .from(users)
       .where(eq(users.familyId, p.familyId));
 
