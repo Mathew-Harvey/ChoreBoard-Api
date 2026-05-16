@@ -124,13 +124,19 @@ export async function boardRoutes(app: FastifyInstance): Promise<void> {
     if (inst.availableAt.getTime() > Date.now()) {
       return reply.code(409).send({ error: 'not_yet_available' });
     }
+    // Targeting model: an explicit `{memberType, memberId}` body wins over
+    // the principal, *regardless* of whether the principal is a parent or a
+    // kid. This makes the kitchen-wall tablet usable as a shared family
+    // device: whichever kid is PIN'd in can drag a chore into a parent's
+    // (or sibling's) swim lane and the chore lands on the right lane.
+    // The drop-target on the Kanban is unambiguous — the user is literally
+    // aiming at the recipient — so a session check on top of it would just
+    // silently break that gesture. We still validate that the target lives
+    // in this family below so a kid can't write rows pointing at strangers.
     const member =
-      p.kind === 'parent' && body.memberType && body.memberId
+      body.memberType && body.memberId
         ? { type: body.memberType, id: body.memberId }
         : principalMember(p);
-    if (p.kind === 'kid' && (member.type !== 'kid' || member.id !== p.kidId)) {
-      return reply.code(403).send({ error: 'not_yours' });
-    }
     if (!(await memberBelongsToFamily(member, p.familyId))) {
       return reply.code(404).send({ error: 'member_not_found' });
     }
@@ -162,13 +168,15 @@ export async function boardRoutes(app: FastifyInstance): Promise<void> {
     if (inst.status !== 'claimed' && inst.status !== 'pending') {
       return reply.code(409).send({ error: 'not_unclaimable' });
     }
-    const member = principalMember(p);
-    const isClaimant =
-      inst.claimedByType === member.type && inst.claimedById === member.id;
-    if (p.kind === 'kid') {
-      if (!isClaimant) return reply.code(403).send({ error: 'not_yours' });
-      if (inst.status === 'pending')
-        return reply.code(409).send({ error: 'already_submitted' });
+    // Same trust model as /claim and /submit: any family member session can
+    // send a `claimed` card back to Available (the drag-to-Available is an
+    // explicit "release this" gesture). Sending a `pending` card back to
+    // Available is effectively a reject and stays parent-only — a kid
+    // session shouldn't be able to undo a submitted card from the shared
+    // tablet because that would silently un-do the claimant's "I'm done"
+    // moment without a parent in the loop.
+    if (p.kind === 'kid' && inst.status === 'pending') {
+      return reply.code(409).send({ error: 'already_submitted' });
     }
     const [updated] = await db
       .update(choreInstances)
@@ -205,10 +213,10 @@ export async function boardRoutes(app: FastifyInstance): Promise<void> {
     if (inst.status !== 'claimed') {
       return reply.code(409).send({ error: 'must_be_claimed' });
     }
-    const member = principalMember(p);
-    if (p.kind === 'kid' && (inst.claimedByType !== member.type || inst.claimedById !== member.id)) {
-      return reply.code(403).send({ error: 'not_yours' });
-    }
+    // Same trust model as /claim: on a shared family tablet, any signed-in
+    // family member can submit any claimed chore. The visible drag-to-Pending
+    // is the explicit intent. A parent (or kid acting on behalf of one) can
+    // therefore submit their own chore from a tablet that's PIN'd into a kid.
     const [chore] = await db.select().from(chores).where(eq(chores.id, inst.choreId)).limit(1);
     const effectivePhotoKey = body.photoKey ?? inst.photoKey ?? null;
     if (chore?.photoRequired && !effectivePhotoKey) {
