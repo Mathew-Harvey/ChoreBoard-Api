@@ -4,7 +4,6 @@ import { z } from 'zod';
 import { db } from '../db/client.js';
 import { families, kids, users } from '../db/schema.js';
 import {
-  currentWeekStart,
   lastPayoutMoment,
   startOfLocalDay,
   startOfLocalMonth,
@@ -177,7 +176,7 @@ export async function historyStatsRoutes(app: FastifyInstance): Promise<void> {
       select
         coalesce(sum(amount_cents), 0)::text as cents,
         count(*)::text as chores,
-        count(distinct (member_type, member_id))::text as active_members,
+        count(distinct member_type::text || ':' || member_id::text)::text as active_members,
         (select day from best) as best_day,
         (select cents::text from best) as best_day_cents,
         (select chores::text from best) as best_day_chores
@@ -700,7 +699,12 @@ function rangeForPreset(preset: Preset, fam: Family, now: Date): ResolvedRange {
       };
     }
     case 'last_4_weeks': {
-      const thisWeekStart = currentWeekStart(now, tz, fam.payoutDay);
+      const thisWeekStart = lastPayoutMoment(
+        now,
+        tz,
+        fam.payoutDay,
+        fam.payoutTime,
+      );
       // Walk four payout cycles back without assuming exact 7×24h slabs.
       let cursor = thisWeekStart;
       for (let i = 0; i < 4; i++) {
