@@ -14,13 +14,21 @@
 
 import { eq } from 'drizzle-orm';
 import { db } from '../db/client.js';
-import { deviceTokens, pushSubscriptions } from '../db/schema.js';
+import { deviceTokens, notificationPrefs, pushSubscriptions } from '../db/schema.js';
 import {
   config,
   isApnsConfigured,
   isFcmConfigured,
   isWebPushConfigured,
 } from '../config.js';
+
+/**
+ * The four push events the app can fire today. Every callsite passes one of
+ * these to `sendToUser` so the per-parent prefs gate (PR 6) can suppress
+ * delivery the parent has opted out of, or the parent's quiet hours window
+ * silences (evaluated in the parent's `quiet_tz`).
+ */
+export type PushKind = 'approval_request' | 'goal_hit' | 'champion' | 'weekly_summary';
 
 export type PushPayload = {
   title: string;
@@ -44,12 +52,28 @@ const noop: TransportResult = { sent: 0, failed: 0 };
  * Send a push to all of a parent's devices (iOS, Android, browser). Returns
  * a per-transport tally. Failures are logged but don't throw — push is best
  * effort by definition.
+ *
+ * Honours the per-parent `notification_prefs` matrix and quiet hours (PR 6)
+ * unless `kind` is omitted, in which case we deliver as before — older
+ * callers without a `kind` are still supported during the migration window.
  */
-export async function sendToUser(userId: string, payload: PushPayload): Promise<{
+export async function sendToUser(
+  userId: string,
+  payload: PushPayload,
+  kind?: PushKind,
+): Promise<{
   apns: TransportResult;
   fcm: TransportResult;
   web: TransportResult;
+  suppressed?: 'pref' | 'quiet_hours';
 }> {
+  if (kind) {
+    const reason = await suppressedReason(userId, kind, new Date());
+    if (reason) {
+      console.info(`[push] suppressed kind=${kind} user=${userId} reason=${reason}`);
+      return { apns: noop, fcm: noop, web: noop, suppressed: reason };
+    }
+  }
   const tokens = await db
     .select()
     .from(deviceTokens)
@@ -71,6 +95,63 @@ export async function sendToUser(userId: string, payload: PushPayload): Promise<
     ),
   ]);
   return { apns, fcm, web };
+}
+
+// ---------------------------------------------------------------------------
+// Per-parent prefs gate
+// ---------------------------------------------------------------------------
+//
+// Returns null when the push should proceed, otherwise a tag describing
+// which suppressor fired. Missing prefs rows fall through to the row's
+// default values (everything ON, no quiet hours), which match the
+// backfill-on-signup behaviour. Quiet hours are evaluated in the parent's
+// own `quiet_tz`, with wrap-around (e.g. 22:00 → 06:00) honoured.
+
+async function suppressedReason(
+  userId: string,
+  kind: PushKind,
+  now: Date,
+): Promise<'pref' | 'quiet_hours' | null> {
+  const [p] = await db
+    .select()
+    .from(notificationPrefs)
+    .where(eq(notificationPrefs.userId, userId))
+    .limit(1);
+  if (!p) return null;
+
+  const enabled = pickPushFlag(p, kind);
+  if (!enabled) return 'pref';
+
+  if (p.quietStart && p.quietEnd) {
+    const hhmm = new Intl.DateTimeFormat('en-GB', {
+      timeZone: p.quietTz,
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    }).format(now);
+    const inQuiet =
+      p.quietStart <= p.quietEnd
+        ? hhmm >= p.quietStart && hhmm < p.quietEnd
+        : hhmm >= p.quietStart || hhmm < p.quietEnd;
+    if (inQuiet) return 'quiet_hours';
+  }
+  return null;
+}
+
+function pickPushFlag(
+  p: typeof notificationPrefs.$inferSelect,
+  kind: PushKind,
+): boolean {
+  switch (kind) {
+    case 'approval_request':
+      return p.pushApprovalsRequested;
+    case 'goal_hit':
+      return p.pushGoalHit;
+    case 'champion':
+      return p.pushChampion;
+    case 'weekly_summary':
+      return p.pushWeeklySummary;
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -40,17 +40,65 @@ The ChoreBoard-Api repo deploys as a **single Render web service** that
 serves both `api.choreboard.io` and `app.choreboard.io`. Save yourself
 two services' worth of plan cost.
 
-### Render service settings
+### Render Blueprint (recommended)
+
+The repo ships a [`render.yaml`](./render.yaml) Blueprint that declares
+the web service, the managed Postgres database, and every environment
+variable. To apply:
+
+1. Render dashboard → **New +** → **Blueprint**.
+2. Connect this repo and confirm. Render reads `render.yaml` and
+   provisions everything in one shot.
+3. After the first apply, fill in the `sync: false` secrets (Apple,
+   Google, Stripe, push) via the dashboard. Anything with a literal
+   `value` is checked into the Blueprint and stays in sync on every
+   redeploy.
+
+The Blueprint commits the deploy contract to source control so a human
+can't accidentally drift the build/start/migrate steps from a UI form.
+
+### What the Blueprint runs
+
+| Phase                | Command                                  | When            |
+|----------------------|------------------------------------------|-----------------|
+| **Build**            | builds the SPA bundle then the API       | After every push |
+| **Pre-deploy**       | `npm run db:migrate:prod`                | After build, **before** traffic switches |
+| **Start**            | `npm start`                              | New instance comes up |
+| **Health check**     | `GET /health`                            | Continuous |
+
+The pre-deploy hook is the load-bearing piece for redeploys: every push
+to `main` runs `db:migrate:prod` against the live Postgres before a
+single request hits the new instance. A failed build never half-migrates
+the database; a successful build that fails to migrate fails the whole
+deploy and traffic stays on the old instance. Drizzle's migrator is
+idempotent (it tracks applied migrations in
+`drizzle.__drizzle_migrations`), so running on every deploy is safe.
+
+### Manual configuration (only if not using the Blueprint)
+
+If you want to skip `render.yaml` and click everything by hand:
 
 - **Build command:**
   ```
   cd ../ChoreBoard-Web && npm ci && npm run build && \
-  cd ../ChoreBoard-Api && npm ci && npm run build && npm run db:migrate
+  cd ../ChoreBoard-Api && npm ci && npm run build
   ```
-  (or split the web/API builds across two CI steps if you want a
-  monorepo-flavoured setup; Render also supports cross-service builds.)
+- **Pre-deploy command:** `npm run db:migrate:prod`
 - **Start command:** `npm start`
 - **Health check:** `/health` (returns `{ ok: true, time: ... }`)
+
+Do **not** put `db:migrate` in the build command. A migration that
+runs during build executes against prod even if the build later fails;
+worse, Render's build cache can skip a build, in which case migrations
+also skip and your schema drifts away from your code.
+
+### Migrating off Render later
+
+If we move to a host without a pre-deploy hook (Fly.io, plain Docker,
+etc.), set `RUN_MIGRATIONS_ON_BOOT=true` and the API will run the
+migrator itself on every process boot before binding the listener. Off
+by default on Render so we don't pay the duplicate-run cost on every
+cold-start.
 
 ### Custom domains
 

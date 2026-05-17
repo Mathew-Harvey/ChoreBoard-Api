@@ -17,13 +17,14 @@ import { milestonesRoutes } from './routes/milestones.js';
 import { sseRoutes } from './routes/sse.js';
 import { devicesRoutes } from './routes/devices.js';
 import { billingRoutes } from './routes/billing.js';
-import { whiteboardRoutes } from './routes/whiteboards.js';
-import { listsRoutes } from './routes/lists.js';
-import { productsRoutes } from './routes/products.js';
+import { pairingsRoutes } from './routes/pairings.js';
+import { notificationsRoutes } from './routes/notifications.js';
 import { wellKnownRoutes } from './routes/wellKnown.js';
 import { adminDashStatsRoutes } from './routes/adminDashStats.js';
 import { scheduler } from './scheduler/runner.js';
 import { ensureBadgeCatalogSeeded } from './domain/gamification.js';
+import { migrate } from 'drizzle-orm/node-postgres/migrator';
+import { db } from './db/client.js';
 
 async function main() {
   const app = Fastify({
@@ -68,9 +69,8 @@ async function main() {
       await api.register(sseRoutes);
       await api.register(devicesRoutes);
       await api.register(billingRoutes);
-      await api.register(whiteboardRoutes);
-      await api.register(listsRoutes);
-      await api.register(productsRoutes);
+      await api.register(pairingsRoutes);
+      await api.register(notificationsRoutes);
       await api.register(adminDashStatsRoutes);
     },
     { prefix: '/api' },
@@ -110,6 +110,18 @@ async function main() {
     if (status >= 500) app.log.error(err);
     reply.code(status).send({ error: err.message ?? 'server_error' });
   });
+
+  // Optional in-process migration runner. Off by default on Render
+  // (where render.yaml's `preDeployCommand` runs `npm run db:migrate:prod`
+  // after a successful build and before traffic switches). Enable via
+  // `RUN_MIGRATIONS_ON_BOOT=true` if we ever deploy somewhere without a
+  // pre-deploy hook — Drizzle's migrator is idempotent so the duplicate
+  // run is safe.
+  if (config.runMigrationsOnBoot) {
+    app.log.info('Running database migrations on boot...');
+    await migrate(db, { migrationsFolder: './drizzle' });
+    app.log.info('Migrations applied.');
+  }
 
   await ensureBadgeCatalogSeeded();
   await scheduler.start();

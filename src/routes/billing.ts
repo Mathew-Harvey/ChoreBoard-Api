@@ -34,6 +34,17 @@ import {
  * the client gates the surfaces.
  */
 export async function billingRoutes(app: FastifyInstance): Promise<void> {
+  // ----- Headline price quote ----------------------------------------------
+  // Used by the SPA's PlanUpsellSheet so the price string is never hardcoded
+  // in the bundle. Marketing locks `PRICING_HEADLINE_CENTS` and
+  // `PRICING_CURRENCY` in env; this endpoint just echoes them back. Public
+  // (unauthenticated) so the upsell can render even on the very first
+  // signed-in render before the session query has settled.
+  app.get('/billing/quote', async () => ({
+    headlinePriceCents: config.pricing.headlinePriceCents,
+    currency: config.pricing.currency,
+  }));
+
   // ----- Status ------------------------------------------------------------
   app.get('/billing/me', async (req) => {
     const p = req.requireParent();

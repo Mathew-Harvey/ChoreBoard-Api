@@ -112,7 +112,6 @@ async function computeDashPayload() {
     workspaceTypeRow,
     dailySignupRows,
     dailyApprovedRows,
-    listKindRows,
     topChoreRows,
     recentSignupRows,
   ] = await Promise.all([
@@ -143,13 +142,10 @@ async function computeDashPayload() {
         (SELECT COUNT(*)::int FROM families)     AS workspaces,
         (SELECT COUNT(*)::int FROM kids)         AS kids,
         (SELECT COUNT(*)::int FROM chores)       AS chores,
-        (SELECT COUNT(*)::int FROM lists)        AS lists,
-        (SELECT COUNT(*)::int FROM whiteboards)  AS whiteboards,
         (SELECT COUNT(*)::int FROM milestones)   AS milestones_total
     `),
     db.execute<Row>(sql`
       SELECT
-        (SELECT COUNT(*)::int FROM list_items WHERE checked_at IS NOT NULL) AS list_items_checked,
         (SELECT COUNT(*)::int FROM milestone_hits)                          AS milestone_hits_total,
         (SELECT COUNT(*)::int FROM badges_awarded)                          AS badges_awarded
     `),
@@ -192,12 +188,6 @@ async function computeDashPayload() {
       WHERE status = 'approved' AND approved_at >= now() - interval '90 days'
       GROUP BY 1
       ORDER BY 1
-    `),
-    db.execute<Row>(sql`
-      SELECT kind AS category, COUNT(*)::int AS count
-      FROM lists
-      GROUP BY kind
-      ORDER BY count DESC
     `),
     db.execute<Row>(sql`
       SELECT c.name AS name, COUNT(*)::int AS installs
@@ -269,12 +259,9 @@ async function computeDashPayload() {
       kids: Number(ft.kids ?? 0),
       chores: Number(ft.chores ?? 0),
       completedChores: Number(cit.completed_total ?? 0),
-      lists: Number(ft.lists ?? 0),
-      whiteboards: Number(ft.whiteboards ?? 0),
       milestones: Number(ft.milestones_total ?? 0),
       milestoneHits: Number(mt.milestone_hits_total ?? 0),
       badgesAwarded: Number(mt.badges_awarded ?? 0),
-      listItemsChecked: Number(mt.list_items_checked ?? 0),
     },
     activity: {
       signups24h: Number(ut.signups_24h ?? 0),
@@ -296,10 +283,6 @@ async function computeDashPayload() {
     })),
     dailySignups,
     dailyApplets,
-    marketplaceCategories: listKindRows.rows.map((r) => ({
-      category: String((r as Row).category),
-      count: Number((r as Row).count ?? 0),
-    })),
     topPublicApplets: topChoreRows.rows.map((r) => ({
       name: String((r as Row).name),
       icon: null as string | null,

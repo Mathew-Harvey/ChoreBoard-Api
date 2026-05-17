@@ -18,6 +18,23 @@ export const config = {
   sessionSecret: optional('SESSION_SECRET', 'dev-secret-change-me'),
   sessionCookieName: optional('SESSION_COOKIE_NAME', 'cb_session'),
   sessionTtlDays: Number(optional('SESSION_TTL_DAYS', '30')),
+
+  // How long an "elevated" parent session on a shared family device (e.g.
+  // the kitchen tablet) stays valid for write operations after the last
+  // approve/reject/etc. Reads do NOT extend the timer. After idle-out the
+  // session is auto-revoked and the device falls back to whatever kid
+  // session was active before. See routes/auth.ts → /auth/elevate.
+  parentTabletIdleMin: Number(optional('PARENT_TABLET_IDLE_MIN', '30')),
+
+  // How long a 6-digit pairing code stays valid before a new one must be
+  // generated. Single-use; the code is hashed at rest. See
+  // routes/pairings.ts.
+  pairingCodeTtlMin: Number(optional('PAIRING_CODE_TTL_MIN', '10')),
+
+  // How long a co-parent invite link stays usable. Was previously hardcoded
+  // in routes/family.ts; centralised here so all "thing expires after X"
+  // numbers live in one place.
+  inviteTtlDays: Number(optional('INVITE_TTL_DAYS', '7')),
   // Comma-separated list of allowed CORS origins. Includes Capacitor's
   // schemes (capacitor://localhost, https://localhost) so the iOS / Android
   // shells can call api.choreboard.io.
@@ -60,9 +77,30 @@ export const config = {
   googlePlayServiceAccountJson: process.env.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON ?? '',
   googlePlayPackageName: process.env.GOOGLE_PLAY_PACKAGE_NAME ?? 'io.choreboard.app',
 
+  // --- Pricing ---
+  // Headline subscription price for the Family plan, as a single integer
+  // count of cents and an ISO 4217 currency code. Surfaced verbatim by
+  // GET /api/billing/quote so the SPA never hardcodes a number — the upsell
+  // sheet, the admin billing page, and the wizard all read from this one
+  // place. Marketing locks the value before App Store / Play Console
+  // submission; until then the placeholder lets the upsell flow be tested
+  // end-to-end.
+  pricing: {
+    headlinePriceCents: Number(optional('PRICING_HEADLINE_CENTS', '599')),
+    currency: optional('PRICING_CURRENCY', 'AUD'),
+  },
+
   // Public-facing app URL — used to build absolute links in emails / push
   // payloads and as the canonical "home" URL in App Store deep links.
   appUrl: process.env.APP_URL ?? 'https://app.choreboard.io',
+
+  // Belt-and-braces flag for hosts without a proper pre-deploy hook. When
+  // set to 'true' the API runs the Drizzle migrator once on process boot
+  // before binding the listener. On Render this is unnecessary (the
+  // `preDeployCommand` in render.yaml already handles it) and stays off
+  // by default; running migrations twice is a fast no-op but wastes a
+  // few seconds of cold-start. Useful if we ever swap hosts.
+  runMigrationsOnBoot: optional('RUN_MIGRATIONS_ON_BOOT', 'false') === 'true',
 };
 
 export const isProd = config.nodeEnv === 'production';

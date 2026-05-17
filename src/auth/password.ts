@@ -23,3 +23,15 @@ export function hashPin(pin: string): Promise<string> {
 export function verifyPin(hash: string, pin: string): Promise<boolean> {
   return argon2.verify(hash, pin);
 }
+
+// Pairing codes are 6 digits. Same argon2id parameters — argon2's deliberate
+// slowness is what bounds brute-force on the 1M-code keyspace; we additionally
+// only ever scan the (small) set of active pairings system-wide on consume.
+export function hashPairingCode(code: string): Promise<string> {
+  if (!/^\d{6}$/.test(code)) throw new Error('Pairing code must be 6 digits');
+  return argon2.hash(code, opts);
+}
+
+export function verifyPairingCode(hash: string, code: string): Promise<boolean> {
+  return argon2.verify(hash, code);
+}

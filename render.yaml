@@ -1,0 +1,164 @@
+# Render Blueprint for ChoreBoard.
+#
+# Apply with: Render dashboard → New → Blueprint → point at this repo.
+# Render reads this file on every deploy and applies any drift to the
+# managed services declaratively. The values below are the SOURCE OF TRUTH
+# for production deploy configuration; if you change something here, push
+# and Render will re-converge on the next deploy.
+#
+# Why this file exists in this repo:
+#
+#  1. The migration command runs as a `preDeployCommand` rather than
+#     inside the build command. Pre-deploy runs *after* a successful
+#     build and *before* traffic is switched to the new instance, which
+#     means:
+#       - A failed build never half-migrates the database.
+#       - Every redeploy reliably runs migrations, even if Render's
+#         build cache short-circuits the build itself.
+#       - Drizzle's migrator is idempotent (it tracks applied migrations
+#         in the `drizzle.__drizzle_migrations` table), so running on
+#         every deploy is safe.
+#
+#  2. We pin `db:migrate:prod` (compiled JS) instead of `db:migrate`
+#     (tsx running TypeScript source) so the migration step doesn't
+#     depend on a dev tool to be present in the production image.
+#
+#  3. The web service binds two custom domains (`api.choreboard.io` and
+#     `app.choreboard.io`) to a single Render service — same code, same
+#     deploy, two CNAMEs. See DEPLOY.md §2.
+
+services:
+  - type: web
+    name: choreboard-api
+    runtime: node
+    plan: starter
+    region: oregon
+    branch: main
+    rootDir: .
+    autoDeploy: true
+
+    # Build the SPA bundle then the API. The web build's output ends up at
+    # `../ChoreBoard-Web/dist`, which the API serves via WEB_DIST_DIR.
+    # Migrations are NOT run here — see preDeployCommand below.
+    buildCommand: |
+      cd ../ChoreBoard-Web && npm ci && npm run build && \
+      cd ../ChoreBoard-Api && npm ci && npm run build
+
+    # Runs after build, before the new instance is rotated into traffic.
+    # Drizzle's migrator is idempotent: a no-op on already-applied
+    # migrations, fast on a clean database, atomic per migration file.
+    preDeployCommand: npm run db:migrate:prod
+
+    startCommand: npm start
+    healthCheckPath: /health
+
+    envVars:
+      - key: NODE_ENV
+        value: production
+
+      # Postgres: bind to the managed database below by name.
+      - key: DATABASE_URL
+        fromDatabase:
+          name: choreboard-db
+          property: connectionString
+
+      # Generated once on first apply, then reused. Render's `generateValue`
+      # gives us a strong random secret without us having to ferry it.
+      - key: SESSION_SECRET
+        generateValue: true
+
+      - key: SESSION_COOKIE_NAME
+        value: cb_session
+      - key: SESSION_TTL_DAYS
+        value: "30"
+
+      # PR 0 constants — locked in env so they can be tuned without a
+      # code redeploy. Defaults match the Round-2 design contract.
+      - key: PARENT_TABLET_IDLE_MIN
+        value: "30"
+      - key: PAIRING_CODE_TTL_MIN
+        value: "10"
+      - key: INVITE_TTL_DAYS
+        value: "7"
+
+      # Marketing locks PRICING_HEADLINE_CENTS before App Store / Play
+      # Console submission. Until then the placeholder lets the upsell
+      # sheet render an honest number end-to-end in dev/staging.
+      - key: PRICING_HEADLINE_CENTS
+        value: "599"
+      - key: PRICING_CURRENCY
+        value: AUD
+
+      # Single-origin SPA + API. Capacitor schemes are included so the
+      # native shells can call `api.choreboard.io` from inside WKWebView.
+      - key: WEB_ORIGIN
+        value: https://app.choreboard.io,https://choreboard.io,capacitor://localhost,https://localhost
+      - key: COOKIE_DOMAIN
+        value: .choreboard.io
+      - key: WEB_DIST_DIR
+        value: ../ChoreBoard-Web/dist
+      - key: APP_URL
+        value: https://app.choreboard.io
+
+      # Universal Links / App Links — fill once Apple Team ID + Android
+      # signing key are minted. Do NOT commit these values.
+      - key: APPLE_APP_ID
+        sync: false
+      - key: ANDROID_PACKAGE_NAME
+        value: io.choreboard.app
+      - key: ANDROID_CERT_SHA256
+        sync: false
+
+      # Push (APNs / FCM / Web Push). All optional until keys exist; the
+      # push integration's own `isXConfigured()` helpers no-op if unset.
+      - key: VAPID_PUBLIC_KEY
+        sync: false
+      - key: VAPID_PRIVATE_KEY
+        sync: false
+      - key: VAPID_SUBJECT
+        value: mailto:support@choreboard.io
+      - key: APNS_TEAM_ID
+        sync: false
+      - key: APNS_KEY_ID
+        sync: false
+      - key: APNS_BUNDLE_ID
+        value: io.choreboard.app
+      - key: APNS_KEY_P8
+        sync: false
+      - key: APNS_PRODUCTION
+        value: "true"
+      - key: FCM_SERVICE_ACCOUNT_JSON
+        sync: false
+
+      # Billing — same shape; values supplied via the Render dashboard
+      # as secrets, never via this file.
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: STRIPE_PRICE_FAMILY
+        sync: false
+      - key: APPLE_SHARED_SECRET
+        sync: false
+      - key: APPLE_BUNDLE_ID
+        value: io.choreboard.app
+      - key: APPLE_NOTIFICATIONS_AUDIENCE
+        value: production
+      - key: GOOGLE_PLAY_SERVICE_ACCOUNT_JSON
+        sync: false
+      - key: GOOGLE_PLAY_PACKAGE_NAME
+        value: io.choreboard.app
+
+      # Optional: when set to "true", the API also runs migrations on
+      # process boot via the in-process fallback in src/server.ts. Leave
+      # OFF on Render (preDeployCommand already handles it; running twice
+      # is a no-op but wastes a few seconds of cold-start time). Useful
+      # if we ever switch to a host without a pre-deploy hook.
+      - key: RUN_MIGRATIONS_ON_BOOT
+        value: "false"
+
+databases:
+  - name: choreboard-db
+    plan: starter
+    region: oregon
+    postgresMajorVersion: 16

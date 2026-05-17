@@ -44,6 +44,23 @@ export const families = pgTable('families', {
   payoutTime: text('payout_time').notNull().default('18:00'), // HH:MM, family timezone
   timezone: text('timezone').notNull().default('Australia/Sydney'),
   ownerUserId: uuid('owner_user_id'), // back-filled after first user insert
+  // Set the moment a parent finishes the four-step OnboardWizard at /onboard
+  // (PR 5). Until this is non-null every parent login on this family is
+  // redirected to /onboard so the cold-start cliff doesn't leave a brand
+  // new household staring at an empty Kanban.
+  onboardingCompletedAt: timestamp('onboarding_completed_at', { withTimezone: true }),
+  // Whether the TV-mode "Champion of the Week" ceremony plays its chime.
+  // Defaults true; surfaced as a toggle in AdminFamily and in the TVMode
+  // settings popover so a parent can mute the kitchen wall without
+  // disabling the celebration entirely.
+  tvCelebrationSound: boolean('tv_celebration_sound').notNull().default(true),
+  // Stamped when a parent dismisses the "Pair a kitchen tablet" sticky
+  // reminder banner that lives above the Kanban. Auto-clears (i.e. the
+  // banner reappears) only if every device pairing is revoked. The
+  // dismissal is only reachable from AdminFamily → Paired devices, on
+  // purpose — a casual close on the banner itself wouldn't kill the
+  // prompt and undermine the second-user pillar.
+  pairingReminderDismissedAt: timestamp('pairing_reminder_dismissed_at', { withTimezone: true }),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
@@ -346,11 +363,19 @@ export const sessions = pgTable(
     familyId: uuid('family_id')
       .notNull()
       .references(() => families.id, { onDelete: 'cascade' }),
-    // 'cookie' for browser sessions, 'bearer' for Capacitor native sessions.
+    // 'cookie' for browser sessions, 'bearer' for Capacitor native sessions,
+    // 'pairing' for the device session minted by POST /api/auth/pair (PR 4).
     // Same opaque token regardless; this column is for telemetry + revoking
     // all native sessions in a single sweep if a device is lost.
     transport: text('transport').notNull().default('cookie'),
     expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+    // Set on a parent session that was created via POST /api/auth/elevate
+    // on a shared family device. While non-null, the session's parent
+    // privileges last only until this timestamp; every write extends it by
+    // config.parentTabletIdleMin minutes, reads do not. The auth plugin
+    // refuses elevated sessions whose elevation has expired and deletes the
+    // session row. Plain (non-elevated) parent sessions leave this null.
+    elevationExpiresAt: timestamp('elevation_expires_at', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => ({
@@ -474,145 +499,6 @@ export const billingEvents = pgTable(
     // Idempotency key — if a webhook is replayed, we no-op.
     eventUniq: uniqueIndex('billing_events_uniq').on(t.source, t.externalEventId),
     familyIdx: index('billing_events_family_idx').on(t.familyId),
-  }),
-);
-
-// ----------------------------------------------------------------------------
-// Whiteboards & lists
-// ----------------------------------------------------------------------------
-// The "Family canvas" feature: a calendar that holds two kinds of artefact —
-// whiteboard sessions (free-form drawings the family did at a given date)
-// and lists (shopping lists, packing lists, todo lists). Each artefact is
-// optionally pinned to a single calendar date so the CalendarDesktop can
-// surface them at a glance.
-//
-// Whiteboard strokes are stored inline as a JSON array on the whiteboard row
-// itself. That trades a bit of write amplification for huge read simplicity:
-// the whole canvas comes back in one row, the realtime reconciler doesn't
-// need to merge per-stroke deltas, and tiny family sessions (a kid scribbles
-// for a minute) don't blow up our row count. If we ever need collaborative
-// live drawing we can split this out into a stroke table later.
-
-export const listKindEnum = pgEnum('list_kind', ['shopping', 'todo', 'packing', 'other']);
-
-export const whiteboards = pgTable(
-  'whiteboards',
-  {
-    id: uuid('id').primaryKey().defaultRandom(),
-    familyId: uuid('family_id')
-      .notNull()
-      .references(() => families.id, { onDelete: 'cascade' }),
-    title: text('title').notNull().default('Untitled board'),
-    // Optional calendar pin. YYYY-MM-DD in family timezone. Null means the
-    // board is unpinned and only shows in the "Recent" stack.
-    date: text('date'),
-    // Logical canvas size at the time of authoring. Renderers re-scale to
-    // fit the viewport; persisted so playback always lays out identically.
-    width: integer('width').notNull().default(1600),
-    height: integer('height').notNull().default(1000),
-    background: text('background').notNull().default('paper'),
-    // Strokes are persisted as a JSON array of {tool,color,size,points:[[x,y]…]}
-    // tuples. `pointsCount` is denormalised for cheap empty-board checks
-    // (e.g. "delete the auto-created board if nothing was drawn").
-    strokesJson: jsonb('strokes_json').notNull().default([]),
-    pointsCount: integer('points_count').notNull().default(0),
-    createdByUserId: uuid('created_by_user_id'),
-    createdByKidId: uuid('created_by_kid_id'),
-    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
-    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
-  },
-  (t) => ({
-    familyIdx: index('whiteboards_family_idx').on(t.familyId),
-    familyDateIdx: index('whiteboards_family_date_idx').on(t.familyId, t.date),
-  }),
-);
-
-export const lists = pgTable(
-  'lists',
-  {
-    id: uuid('id').primaryKey().defaultRandom(),
-    familyId: uuid('family_id')
-      .notNull()
-      .references(() => families.id, { onDelete: 'cascade' }),
-    title: text('title').notNull(),
-    kind: listKindEnum('kind').notNull().default('shopping'),
-    // Optional calendar pin — YYYY-MM-DD in family TZ.
-    date: text('date'),
-    // For shopping lists: the supermarket source we should query when
-    // searching for products inside this list ('woolworths' for now). Null
-    // disables product enrichment entirely.
-    store: text('store'),
-    archivedAt: timestamp('archived_at', { withTimezone: true }),
-    createdByUserId: uuid('created_by_user_id'),
-    createdByKidId: uuid('created_by_kid_id'),
-    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
-    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
-  },
-  (t) => ({
-    familyIdx: index('lists_family_idx').on(t.familyId),
-    familyDateIdx: index('lists_family_date_idx').on(t.familyId, t.date),
-  }),
-);
-
-export const listItems = pgTable(
-  'list_items',
-  {
-    id: uuid('id').primaryKey().defaultRandom(),
-    listId: uuid('list_id')
-      .notNull()
-      .references(() => lists.id, { onDelete: 'cascade' }),
-    familyId: uuid('family_id')
-      .notNull()
-      .references(() => families.id, { onDelete: 'cascade' }),
-    text: text('text').notNull(),
-    qty: integer('qty').notNull().default(1),
-    // Cached product card from the supermarket API (denormalised so the
-    // list renders even if the upstream is down). Shape matches what
-    // /api/products/* returns: { source, externalId, name, image, brand,
-    // packageSize, priceCents, wasPriceCents, onSpecial }.
-    productJson: jsonb('product_json'),
-    // Snapshot price at add-time so list totals are stable even if the
-    // upstream price changes later. We refresh on demand.
-    unitPriceCents: integer('unit_price_cents'),
-    checkedAt: timestamp('checked_at', { withTimezone: true }),
-    checkedByUserId: uuid('checked_by_user_id'),
-    checkedByKidId: uuid('checked_by_kid_id'),
-    sortOrder: integer('sort_order').notNull().default(0),
-    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
-    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
-  },
-  (t) => ({
-    listIdx: index('list_items_list_idx').on(t.listId),
-    familyIdx: index('list_items_family_idx').on(t.familyId),
-  }),
-);
-
-// Cache of products fetched from external supermarket APIs. Keyed by
-// (source, externalId) — externalId is the upstream's stock code (or the
-// barcode for barcode lookups). We refresh entries opportunistically when
-// a search/lookup hits an entry older than `productCacheTtlHours`.
-export const productCache = pgTable(
-  'product_cache',
-  {
-    id: uuid('id').primaryKey().defaultRandom(),
-    source: text('source').notNull(), // 'woolworths' for v1
-    externalId: text('external_id').notNull(),
-    name: text('name').notNull(),
-    brand: text('brand'),
-    image: text('image'),
-    packageSize: text('package_size'),
-    priceCents: integer('price_cents'),
-    wasPriceCents: integer('was_price_cents'),
-    onSpecial: boolean('on_special').notNull().default(false),
-    // Deep link to the upstream product detail page. Cached so the list
-    // editor can render "Buy on Woolworths" affordances without re-fetching.
-    productUrl: text('product_url'),
-    payloadJson: jsonb('payload_json'),
-    cachedAt: timestamp('cached_at', { withTimezone: true }).notNull().defaultNow(),
-  },
-  (t) => ({
-    sourceExtUniq: uniqueIndex('product_cache_source_ext_uniq').on(t.source, t.externalId),
-    nameIdx: index('product_cache_name_idx').on(t.source, t.name),
   }),
 );
 
@@ -741,3 +627,89 @@ export const scheduledJobs = pgTable(
     familyIdx: index('jobs_family_idx').on(t.familyId),
   }),
 );
+
+// ----------------------------------------------------------------------------
+// Device pairings (kitchen tablet flow)
+// ----------------------------------------------------------------------------
+// One row per pairing-code issuance. Any parent can call POST /api/family/pairings
+// to mint a 6-digit code; the plaintext is shown once, the row stores only its
+// argon2 hash. POST /api/auth/pair consumes the code (verifies expiry,
+// non-consumption, non-revocation), creates a long-lived "device session" in
+// the `sessions` table with transport='pairing', and writes that session id
+// back to `consumed_session_id`. Revoking a pairing deletes the device session.
+//
+// Modelled after `family_invites`; same lifecycle (pending → consumed | revoked
+// | expired) and the same defensive-by-construction approach where a single
+// active row "wins" — except we allow multiple consumed pairings per family
+// (one per kitchen tablet, playroom screen, etc).
+
+export const devicePairings = pgTable(
+  'device_pairings',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    familyId: uuid('family_id')
+      .notNull()
+      .references(() => families.id, { onDelete: 'cascade' }),
+    // argon2id hash of the 6-digit code. We never store plaintext.
+    codeHash: text('code_hash').notNull(),
+    issuedByUserId: uuid('issued_by_user_id').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    issuedAt: timestamp('issued_at', { withTimezone: true }).notNull().defaultNow(),
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+    consumedAt: timestamp('consumed_at', { withTimezone: true }),
+    // Human-readable label inferred from the User-Agent at consume time
+    // ("Apple iPad", "Pixel Tablet", etc), editable by parents inline in
+    // AdminFamily → Paired devices.
+    consumedDeviceLabel: text('consumed_device_label'),
+    // Soft pointer (no FK — sessions.id is text) to the device session this
+    // pairing minted. Used by DELETE /api/family/pairings/:id to revoke.
+    consumedSessionId: text('consumed_session_id'),
+    revokedAt: timestamp('revoked_at', { withTimezone: true }),
+    // Bumped by the auth plugin every time a request arrives bearing this
+    // pairing's device session. Powers the "Active 2m ago" / "Last seen
+    // yesterday" display in admin.
+    lastSeenAt: timestamp('last_seen_at', { withTimezone: true }),
+  },
+  (t) => ({
+    familyIdx: index('device_pairings_family_idx').on(t.familyId),
+    activeIdx: index('device_pairings_active_idx').on(
+      t.familyId,
+      t.consumedAt,
+      t.revokedAt,
+    ),
+  }),
+);
+
+// ----------------------------------------------------------------------------
+// Notification preferences (per parent)
+// ----------------------------------------------------------------------------
+// One row per parent. Backfilled on every successful signup or invite-accept;
+// the push fan-out in `integrations/push.ts` reads this to gate per-event
+// delivery, and (when Resend lands) the email fan-out reads the email_*
+// columns. Quiet hours are evaluated in the parent's own `quiet_tz` so a
+// travelling parent isn't pinged at 2am their local time just because the
+// family's clock is in Sydney.
+
+export const notificationPrefs = pgTable('notification_prefs', {
+  userId: uuid('user_id')
+    .primaryKey()
+    .references(() => users.id, { onDelete: 'cascade' }),
+  pushApprovalsRequested: boolean('push_approvals_requested').notNull().default(true),
+  emailApprovalsRequested: boolean('email_approvals_requested').notNull().default(true),
+  pushGoalHit: boolean('push_goal_hit').notNull().default(true),
+  emailGoalHit: boolean('email_goal_hit').notNull().default(true),
+  pushChampion: boolean('push_champion').notNull().default(true),
+  emailChampion: boolean('email_champion').notNull().default(true),
+  pushWeeklySummary: boolean('push_weekly_summary').notNull().default(true),
+  emailWeeklySummary: boolean('email_weekly_summary').notNull().default(true),
+  // 'HH:MM' or null. Both must be set together; quiet hours wrap midnight
+  // (e.g. 21:30 → 06:00) and the wrap-around case is honoured by the
+  // delivery gate.
+  quietStart: text('quiet_start'),
+  quietEnd: text('quiet_end'),
+  // Defaults to families.timezone at row-create time but is independently
+  // editable so a parent on the road can set their own quiet hours.
+  quietTz: text('quiet_tz').notNull().default('Australia/Sydney'),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+});

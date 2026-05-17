@@ -57,6 +57,13 @@
       "when": 1778935393075,
       "tag": "0007_add_member_gender",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1779129600000,
+      "tag": "0008_pair_and_prefs",
+      "breakpoints": true
     }
   ]
 }

@@ -2,7 +2,14 @@ import type { FastifyInstance } from 'fastify';
 import { and, eq, gt, isNull } from 'drizzle-orm';
 import { z } from 'zod';
 import { db } from '../db/client.js';
-import { familyInvites, families, kids, users, chores, sessions } from '../db/schema.js';
+import {
+  familyInvites,
+  families,
+  kids,
+  notificationPrefs,
+  sessions,
+  users,
+} from '../db/schema.js';
 import { hashPassword, verifyPassword, verifyPin } from '../auth/password.js';
 import {
   endSession,
@@ -10,9 +17,11 @@ import {
   startKidSession,
   startParentSession,
 } from '../auth/plugin.js';
-import { DEFAULT_CATALOG } from '../domain/defaultCatalog.js';
+import { newSessionId } from '../auth/sessions.js';
 import { scheduler } from '../scheduler/runner.js';
 import { bus } from '../realtime/bus.js';
+import { config } from '../config.js';
+import { getEntitlements } from '../domain/entitlements.js';
 
 export async function authRoutes(app: FastifyInstance): Promise<void> {
   // ----- Parent signup (creates family + seeds catalog) --------------------
@@ -53,16 +62,19 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       .set({ ownerUserId: user!.id })
       .where(eq(families.id, family!.id));
 
-    // Seed default catalog.
-    for (const c of DEFAULT_CATALOG) {
-      await db.insert(chores).values({
-        familyId: family!.id,
-        name: c.name,
-        amountCents: c.amountCents,
-        cadenceJson: c.cadence,
-      });
-    }
-    await scheduler.materializeFamily(family!.id);
+    // Backfill the parent's notification_prefs row with permissive defaults
+    // and a quiet_tz that matches the family timezone they just chose. PR 6
+    // exposes a route for the parent to edit it later.
+    await db
+      .insert(notificationPrefs)
+      .values({ userId: user!.id, quietTz: family!.timezone })
+      .onConflictDoNothing({ target: notificationPrefs.userId });
+
+    // No default chore catalog — the four-step OnboardWizard at /onboard
+    // (PR 5) lets the parent pick a starter pack against the rule set in
+    // the Round-2 brief. Brand-new families land on /onboard with zero
+    // chores; ensureWeekCloseJob still primes the Sunday close so the
+    // very first week closes cleanly even if no chores ever land in it.
     await scheduler.ensureWeekCloseJob(family!.id);
 
     const session = await startParentSession(reply, user!.id, family!.id, pickTransport(req));
@@ -87,6 +99,54 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     return { user: publicUser(u), session };
   });
 
+  // ----- Parent elevation on a shared family device ------------------------
+  //
+  // Used by the "Sign me in to approve" sheet on the kitchen tablet (PR 7).
+  // A kid is signed in on this device; a parent walks up to approve a
+  // pending chore. They enter their email + password; we mint a fresh
+  // parent session stamped with elevation_expires_at = now + idle minutes.
+  // Every subsequent write on this session bumps the timer; reads do not.
+  // After idle-out, the session row is deleted by the auth plugin and the
+  // device falls back to the kid principal.
+  //
+  // Mechanically distinct from /auth/login so we can rate-limit it later
+  // and so callers (the SPA's ParentSignInSheet) get a clear contract:
+  // the response token replaces the active session, but only briefly.
+  app.post('/auth/elevate', async (req, reply) => {
+    const body = z
+      .object({ email: z.string().email(), password: z.string() })
+      .parse(req.body);
+    const [u] = await db.select().from(users).where(eq(users.email, body.email)).limit(1);
+    if (!u) return reply.code(401).send({ error: 'invalid_credentials' });
+    const ok = await verifyPassword(u.passwordHash, body.password);
+    if (!ok) return reply.code(401).send({ error: 'invalid_credentials' });
+
+    const transport = pickTransport(req);
+    const elevationExpiresAt = new Date(
+      Date.now() + config.parentTabletIdleMin * 60 * 1000,
+    );
+    const [session] = await db
+      .insert(sessions)
+      .values({
+        id: newSessionId(),
+        userId: u.id,
+        familyId: u.familyId,
+        transport,
+        expiresAt: new Date(Date.now() + config.sessionTtlDays * 24 * 60 * 60 * 1000),
+        elevationExpiresAt,
+      })
+      .returning();
+    if (transport === 'cookie') reply.setSessionCookie(session!.id);
+    return {
+      user: publicUser(u),
+      session: {
+        token: session!.id,
+        expiresAt: session!.expiresAt.toISOString(),
+        elevationExpiresAt: elevationExpiresAt.toISOString(),
+      },
+    };
+  });
+
   // ----- Family kid roster (for the PIN entry screen) ----------------------
   // Returns just enough info to pick which kid you are. No PIN hashes.
   app.get('/auth/family/:familyId/kids', async (req, _reply) => {
@@ -102,18 +162,6 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       .from(kids)
       .where(eq(kids.familyId, params.familyId));
     return { kids: list };
-  });
-
-  // List families by name (so a kid on a fresh device can find their household).
-  // For simplicity v1 has a single-tenant search; you'd want to scope this by code in prod.
-  app.get('/auth/families', async (req, _reply) => {
-    const q = z.object({ q: z.string().min(1).max(64) }).parse(req.query);
-    const list = await db
-      .select({ id: families.id, name: families.name })
-      .from(families)
-      .where(eq(families.name, q.q))
-      .limit(10);
-    return { families: list };
   });
 
   // ----- Kid PIN login -----------------------------------------------------
@@ -140,8 +188,32 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
 
   // ----- Whoami ------------------------------------------------------------
   app.get('/auth/me', async (req, _reply) => {
-    if (!req.principal) return { principal: null };
-    return { principal: req.principal };
+    if (!req.principal) return { principal: null, entitlements: null };
+    // Co-locate entitlements with the session response so the SPA's
+    // useEntitlements hook (PR 8) doesn't need a second round trip on
+    // every page load. Returned for kid principals too — the kid-side UI
+    // doesn't show paywalled features but the entitlements payload tells
+    // the kid's tablet whether the family is on the Family plan, which
+    // matters for things like badge ceilings. Recomputed every call;
+    // cheap enough to not warrant memoisation today.
+    const entitlements = await getEntitlements(req.principal.familyId);
+    return { principal: req.principal, entitlements };
+  });
+
+  // ----- Mark onboarding complete (any parent of the family) ---------------
+  // Called by the final step of OnboardWizard at /onboard once the parent
+  // has named the family payout day, added at least one kid, picked a
+  // starter pack, and seen (or skipped) the device-pairing code. Idempotent:
+  // setting it twice does no harm. Until this is non-null the SPA's parent
+  // route guard redirects every signed-in parent to /onboard.
+  app.post('/auth/onboarding/complete', async (req) => {
+    const p = req.requireParent();
+    await db
+      .update(families)
+      .set({ onboardingCompletedAt: new Date() })
+      .where(eq(families.id, p.familyId));
+    bus.publish(p.familyId, { type: 'family.updated' });
+    return { ok: true };
   });
 
   // ----- Delete own account ------------------------------------------------
@@ -220,6 +292,20 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(409).send({ error: 'email_taken' });
     }
 
+    // Free-tier parent cap. The invite link still goes out, but if the
+    // family slipped onto free since it was issued (cancellation, lapse)
+    // we 402 here so the joiner sees an upgrade prompt rather than a
+    // silently-fragile second-parent seat.
+    const ent = await getEntitlements(result.invite.familyId);
+    if (ent.remaining.parents <= 0) {
+      return reply.code(402).send({
+        error: 'plan_upgrade_required',
+        blockedBy: 'parents_max',
+        currentPlan: ent.plan,
+        limits: ent.limits,
+      });
+    }
+
     const passwordHash = await hashPassword(body.password);
     let accepted: { newUser: typeof users.$inferSelect };
     try {
@@ -257,6 +343,19 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
           .update(familyInvites)
           .set({ consumedByUserId: newUser!.id })
           .where(eq(familyInvites.id, claimedInvite.id));
+
+        // Backfill notification prefs (PR 6). Inherits the family's tz at
+        // create — the new co-parent can change `quiet_tz` later if they
+        // travel.
+        const [fam] = await tx
+          .select({ tz: families.timezone })
+          .from(families)
+          .where(eq(families.id, claimedInvite.familyId))
+          .limit(1);
+        await tx
+          .insert(notificationPrefs)
+          .values({ userId: newUser!.id, quietTz: fam?.tz ?? 'Australia/Sydney' })
+          .onConflictDoNothing({ target: notificationPrefs.userId });
 
         return { newUser: newUser! };
       });

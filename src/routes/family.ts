@@ -8,12 +8,7 @@ import { hashPin } from '../auth/password.js';
 import { bus } from '../realtime/bus.js';
 import { scheduler } from '../scheduler/runner.js';
 import { config } from '../config.js';
-
-// How long a co-parent invite stays usable before the joiner has to ask
-// the owner for a new link. A week is short enough that a stale invite
-// found in someone's old messages is mostly useless, and long enough that
-// the partner doesn't need to act in the same sitting.
-const INVITE_TTL_DAYS = 7;
+import { getEntitlements } from '../domain/entitlements.js';
 
 function buildInviteUrl(token: string): string {
   return `${config.appUrl.replace(/\/$/, '')}/join/${token}`;
@@ -67,6 +62,12 @@ export async function familyRoutes(app: FastifyInstance): Promise<void> {
         payoutDay: z.number().int().min(0).max(6).optional(),
         payoutTime: z.string().regex(/^\d{2}:\d{2}$/).optional(),
         timezone: z.string().optional(),
+        // PR 11 toggle for the TV-mode champion-of-the-week chime.
+        tvCelebrationSound: z.boolean().optional(),
+        // Sentinel from AdminFamily → Paired devices "Hide reminder" link
+        // (PR 9). Server stamps the column with `now()`; passing `false`
+        // clears the dismissal so the banner can come back.
+        pairingReminderDismissed: z.boolean().optional(),
       })
       .parse(req.body);
     if (Object.keys(body).length === 0) {
@@ -77,9 +78,18 @@ export async function familyRoutes(app: FastifyInstance): Promise<void> {
       body.payoutTime !== undefined ||
       body.timezone !== undefined;
 
+    // Translate the dismiss sentinel into a column write; everything else
+    // passes through verbatim. Drop the sentinel field from the patch body
+    // so drizzle doesn't complain about an unknown column.
+    const { pairingReminderDismissed, ...rest } = body;
+    const patch: Record<string, unknown> = { ...rest };
+    if (pairingReminderDismissed !== undefined) {
+      patch.pairingReminderDismissedAt = pairingReminderDismissed ? new Date() : null;
+    }
+
     const [updated] = await db
       .update(families)
-      .set(body)
+      .set(patch)
       .where(eq(families.id, p.familyId))
       .returning();
     if (payoutChanged) {
@@ -101,6 +111,18 @@ export async function familyRoutes(app: FastifyInstance): Promise<void> {
         gender: z.enum(['male', 'female', 'unspecified']).default('unspecified'),
       })
       .parse(req.body);
+    // Free-tier kid cap. The SPA pre-checks via useEntitlements so a parent
+    // at the cap never fills a 30-second form they can't submit; this is
+    // the server-side fallback for stale caches and direct API callers.
+    const ent = await getEntitlements(p.familyId);
+    if (ent.remaining.kids <= 0) {
+      return reply.code(402).send({
+        error: 'plan_upgrade_required',
+        blockedBy: 'kids_max',
+        currentPlan: ent.plan,
+        limits: ent.limits,
+      });
+    }
     const [k] = await db
       .insert(kids)
       .values({
@@ -224,7 +246,7 @@ export async function familyRoutes(app: FastifyInstance): Promise<void> {
       );
 
     const token = nanoid(32);
-    const expiresAt = new Date(now.getTime() + INVITE_TTL_DAYS * 24 * 60 * 60 * 1000);
+    const expiresAt = new Date(now.getTime() + config.inviteTtlDays * 24 * 60 * 60 * 1000);
     const [row] = await db
       .insert(familyInvites)
       .values({

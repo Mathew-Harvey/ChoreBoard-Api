@@ -14,7 +14,9 @@ export async function createSession(input: {
   familyId: string;
   userId?: string | null;
   kidId?: string | null;
-  transport?: 'cookie' | 'bearer';
+  // 'pairing' is the long-lived device session minted by POST /api/auth/pair
+  // (PR 4). It carries no principal — a kid PINs in on top of it later.
+  transport?: 'cookie' | 'bearer' | 'pairing';
 }): Promise<SessionRow> {
   const id = newSessionId();
   const expiresAt = new Date(Date.now() + config.sessionTtlDays * 24 * 60 * 60 * 1000);

@@ -2,7 +2,7 @@ import fp from 'fastify-plugin';
 import type { FastifyReply, FastifyRequest } from 'fastify';
 import { eq } from 'drizzle-orm';
 import { db } from '../db/client.js';
-import { kids, users } from '../db/schema.js';
+import { families, kids, sessions, users } from '../db/schema.js';
 import { config, isProd } from '../config.js';
 import { createSession, deleteSession, getSession, type SessionRow } from './sessions.js';
 
@@ -17,6 +17,12 @@ export type ParentPrincipal = {
   email: string;
   color: string;
   gender: Gender;
+  /**
+   * When the OnboardWizard at /onboard completed for this family. The SPA
+   * uses it to gate App.tsx's signed-in routes — until this is non-null
+   * every parent login lands on /onboard rather than the Kanban.
+   */
+  familyOnboardingCompletedAt: string | null;
 };
 
 export type KidPrincipal = {
@@ -30,7 +36,12 @@ export type KidPrincipal = {
 
 export type Principal = ParentPrincipal | KidPrincipal;
 
-export type SessionTransport = 'cookie' | 'bearer';
+export type SessionTransport = 'cookie' | 'bearer' | 'pairing';
+
+// Narrow set of transports a fresh login can pick. `pairing` is reserved for
+// the device session minted by POST /api/auth/pair and is never inferred from
+// a request — it's set explicitly by that route.
+export type LoginTransport = 'cookie' | 'bearer';
 
 declare module 'fastify' {
   interface FastifyRequest {
@@ -128,11 +139,28 @@ export const authPlugin = fp(async (app) => {
     const session = await getSession(supplied.token);
     if (!session) return;
 
+    // Elevated parent sessions on the kitchen tablet auto-expire after
+    // config.parentTabletIdleMin idle minutes. If the elevation timer has
+    // run out, drop the session row and treat the request as
+    // unauthenticated. The next write the SPA attempts will get a clean
+    // 401 and the kid principal can take back over.
+    if (session.elevationExpiresAt && session.elevationExpiresAt.getTime() < Date.now()) {
+      await db.delete(sessions).where(eq(sessions.id, session.id));
+      return;
+    }
+
     req.session = session;
 
     if (session.userId) {
       const [u] = await db.select().from(users).where(eq(users.id, session.userId)).limit(1);
       if (u) {
+        // Pull the family's onboarding flag in the same hop so we can gate
+        // route-level redirects without a second round trip on the SPA.
+        const fam = await db
+          .select({ onboardingCompletedAt: families.onboardingCompletedAt })
+          .from(families)
+          .where(eq(families.id, u.familyId))
+          .limit(1);
         req.principal = {
           kind: 'parent',
           userId: u.id,
@@ -142,6 +170,8 @@ export const authPlugin = fp(async (app) => {
           email: u.email,
           color: u.color,
           gender: u.gender,
+          familyOnboardingCompletedAt:
+            fam[0]?.onboardingCompletedAt?.toISOString() ?? null,
         };
       }
     } else if (session.kidId) {
@@ -157,6 +187,22 @@ export const authPlugin = fp(async (app) => {
         };
       }
     }
+  });
+
+  // Refresh the elevation timer on writes (POST/PATCH/PUT/DELETE) — reads do
+  // NOT extend it, so a tablet left on the Kanban indefinitely will idle
+  // out. We do this onResponse so a write that ultimately failed (e.g. a
+  // 4xx) still counts as activity — the parent is clearly here, working.
+  app.addHook('onResponse', async (req) => {
+    const session = req.session;
+    if (!session?.elevationExpiresAt) return;
+    const method = req.method.toUpperCase();
+    if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') return;
+    const next = new Date(Date.now() + config.parentTabletIdleMin * 60 * 1000);
+    await db
+      .update(sessions)
+      .set({ elevationExpiresAt: next })
+      .where(eq(sessions.id, session.id));
   });
 });
 
@@ -174,7 +220,7 @@ export async function startParentSession(
   reply: FastifyReply,
   userId: string,
   familyId: string,
-  transport: SessionTransport = 'cookie',
+  transport: LoginTransport = 'cookie',
 ): Promise<SessionBag> {
   const s = await createSession({ familyId, userId, transport });
   if (transport === 'cookie') reply.setSessionCookie(s.id);
@@ -185,7 +231,7 @@ export async function startKidSession(
   reply: FastifyReply,
   kidId: string,
   familyId: string,
-  transport: SessionTransport = 'cookie',
+  transport: LoginTransport = 'cookie',
 ): Promise<SessionBag> {
   const s = await createSession({ familyId, kidId, transport });
   if (transport === 'cookie') reply.setSessionCookie(s.id);
@@ -207,7 +253,7 @@ export async function endSession(req: FastifyRequest, reply: FastifyReply) {
  * Falls back to cookie for everything else, which keeps existing browser
  * behaviour byte-identical.
  */
-export function pickTransport(req: FastifyRequest): SessionTransport {
+export function pickTransport(req: FastifyRequest): LoginTransport {
   const hint = req.headers['x-client'];
   if (typeof hint === 'string' && hint.toLowerCase() === 'native') return 'bearer';
   return 'cookie';

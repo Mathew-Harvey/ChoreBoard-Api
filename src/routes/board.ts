@@ -18,7 +18,14 @@ import {
   recordXp,
 } from '../domain/gamification.js';
 import { evaluateMilestones } from '../domain/milestones.js';
-import { nextOccurrenceAfter, startOfLocalDay, type Cadence } from '../domain/cadence.js';
+import {
+  localDayKey,
+  nextOccurrenceAfter,
+  occurrencesBetween,
+  startOfLocalDay,
+  zonedDateToUtc,
+  type Cadence,
+} from '../domain/cadence.js';
 import { memberBelongsToFamily } from '../domain/membership.js';
 
 type Txn = DB | Parameters<Parameters<DB['transaction']>[0]>[0];
@@ -108,11 +115,178 @@ export async function boardRoutes(app: FastifyInstance): Promise<void> {
         timezone: fam.timezone,
         payoutDay: fam.payoutDay,
         payoutTime: fam.payoutTime,
+        onboardingCompletedAt: fam.onboardingCompletedAt?.toISOString() ?? null,
+        tvCelebrationSound: fam.tvCelebrationSound,
+        pairingReminderDismissedAt:
+          fam.pairingReminderDismissedAt?.toISOString() ?? null,
       },
       instances: decorated,
       kids: ks,
       parents: us,
     };
+  });
+
+  // GET /board/schedule?from=YYYY-MM-DD&to=YYYY-MM-DD — month-grid feed for
+  // the Schedule desktop (PR 10). Returns the materialised chore_instances
+  // in the window AND projected occurrences for any active chore whose
+  // cadence fires in the window past the materializer's horizon.
+  //
+  // Projected entries get synthetic ids of the form `proj:<choreId>:<isoTime>`
+  // so the SPA can identify them and treat them as preview-only (you can't
+  // claim a chore that doesn't exist in the DB yet — it'll materialise on
+  // the day-of via the scheduler). Materialised + projected days are merged
+  // and grouped by `localDayKey` in the family timezone.
+  app.get('/board/schedule', async (req, reply) => {
+    const p = req.requireAnyMember();
+    const q = z
+      .object({
+        from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+        to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+      })
+      .parse(req.query);
+    const [fam] = await db
+      .select()
+      .from(families)
+      .where(eq(families.id, p.familyId))
+      .limit(1);
+    if (!fam) return reply.code(404).send({ error: 'family_missing' });
+
+    // Convert window endpoints to UTC moments. `from` is the start of that
+    // local day; `to` is the end (start of the day *after*).
+    const [fy, fm, fd] = q.from.split('-').map(Number) as [number, number, number];
+    const [ty, tm, td] = q.to.split('-').map(Number) as [number, number, number];
+    const fromUtc = zonedDateToUtc(fy, fm, fd, 0, 0, fam.timezone);
+    const toExclusive = zonedDateToUtc(ty, tm, td, 0, 0, fam.timezone);
+    // toExclusive should be the *day after* `to` so the inclusive end is honoured.
+    const toUtc = new Date(toExclusive.getTime() + 24 * 60 * 60 * 1000);
+
+    const insts = await db
+      .select({
+        id: choreInstances.id,
+        choreId: choreInstances.choreId,
+        availableAt: choreInstances.availableAt,
+        dueAt: choreInstances.dueAt,
+        status: choreInstances.status,
+        claimedByType: choreInstances.claimedByType,
+        claimedById: choreInstances.claimedById,
+        claimedAt: choreInstances.claimedAt,
+        completedAt: choreInstances.completedAt,
+        approvedAt: choreInstances.approvedAt,
+        photoKey: choreInstances.photoKey,
+        choreName: chores.name,
+        amountCents: chores.amountCents,
+        photoRequired: chores.photoRequired,
+      })
+      .from(choreInstances)
+      .innerJoin(chores, eq(chores.id, choreInstances.choreId))
+      .where(
+        and(
+          eq(choreInstances.familyId, p.familyId),
+          gte(choreInstances.availableAt, fromUtc),
+          lte(choreInstances.availableAt, toUtc),
+        ),
+      );
+
+    // Build a set of (choreId, available_at ms) keys we already have, so
+    // the projection step skips anything the materializer's already
+    // produced.
+    const haveKey = new Set(insts.map((i) => `${i.choreId}:${i.availableAt.getTime()}`));
+
+    // Project unmaterialised occurrences for active chores. Cap horizon at
+    // the requested `to` end so we never fan past what's asked.
+    const activeChores = await db
+      .select({
+        id: chores.id,
+        name: chores.name,
+        amountCents: chores.amountCents,
+        cadenceJson: chores.cadenceJson,
+        photoRequired: chores.photoRequired,
+      })
+      .from(chores)
+      .where(and(eq(chores.familyId, p.familyId), eq(chores.active, true)));
+
+    const horizonDays = Math.max(
+      1,
+      Math.ceil((toUtc.getTime() - fromUtc.getTime()) / (24 * 60 * 60 * 1000)),
+    );
+
+    type ScheduleInst = {
+      id: string;
+      choreId: string;
+      availableAt: string;
+      dueAt: string | null;
+      status: 'available' | 'claimed' | 'pending' | 'approved' | 'missed' | 'rejected';
+      claimedByType: 'user' | 'kid' | null;
+      claimedById: string | null;
+      claimedAt: string | null;
+      completedAt: string | null;
+      approvedAt: string | null;
+      photoKey: string | null;
+      choreName: string;
+      amountCents: number;
+      photoRequired: boolean;
+      projected: boolean;
+    };
+
+    const projected: ScheduleInst[] = [];
+    for (const c of activeChores) {
+      const occs = occurrencesBetween(
+        c.cadenceJson as Cadence,
+        fromUtc,
+        horizonDays,
+        fam.timezone,
+      );
+      for (const occ of occs) {
+        if (occ.getTime() > toUtc.getTime()) continue;
+        if (haveKey.has(`${c.id}:${occ.getTime()}`)) continue;
+        projected.push({
+          id: `proj:${c.id}:${occ.toISOString()}`,
+          choreId: c.id,
+          availableAt: occ.toISOString(),
+          dueAt: occ.toISOString(),
+          status: 'available',
+          claimedByType: null,
+          claimedById: null,
+          claimedAt: null,
+          completedAt: null,
+          approvedAt: null,
+          photoKey: null,
+          choreName: c.name,
+          amountCents: c.amountCents,
+          photoRequired: c.photoRequired,
+          projected: true,
+        });
+      }
+    }
+
+    const materialised: ScheduleInst[] = insts.map((i) => ({
+      id: i.id,
+      choreId: i.choreId,
+      availableAt: i.availableAt.toISOString(),
+      dueAt: i.dueAt?.toISOString() ?? null,
+      status: i.status,
+      claimedByType: i.claimedByType,
+      claimedById: i.claimedById,
+      claimedAt: i.claimedAt?.toISOString() ?? null,
+      completedAt: i.completedAt?.toISOString() ?? null,
+      approvedAt: i.approvedAt?.toISOString() ?? null,
+      photoKey: i.photoKey,
+      choreName: i.choreName,
+      amountCents: i.amountCents,
+      photoRequired: i.photoRequired,
+      projected: false,
+    }));
+
+    const all = [...materialised, ...projected].sort((a, b) =>
+      a.availableAt.localeCompare(b.availableAt),
+    );
+    const days: Record<string, ScheduleInst[]> = {};
+    for (const inst of all) {
+      const key = localDayKey(new Date(inst.availableAt), fam.timezone);
+      (days[key] ??= []).push(inst);
+    }
+
+    return { from: q.from, to: q.to, timezone: fam.timezone, days };
   });
 
   // POST /board/instances/:id/claim
