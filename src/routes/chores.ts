@@ -2,10 +2,15 @@ import type { FastifyInstance } from 'fastify';
 import { and, asc, eq } from 'drizzle-orm';
 import { z } from 'zod';
 import { db } from '../db/client.js';
-import { chores, families } from '../db/schema.js';
+import { chores, families, kids } from '../db/schema.js';
 import { scheduler } from '../scheduler/runner.js';
 import { bus } from '../realtime/bus.js';
 import { spawnInstanceNow } from './board.js';
+import { CHORE_CATALOG, suggestForAges } from '../domain/choreCatalog.js';
+import {
+  defaultCurrencyForCountry,
+  suggestPriceForCatalog,
+} from '../domain/chorePricing.js';
 
 const timeRe = /^\d{2}:\d{2}$/;
 const cadenceSchema = z.discriminatedUnion('kind', [
@@ -48,6 +53,138 @@ export async function choreRoutes(app: FastifyInstance): Promise<void> {
       .where(eq(chores.familyId, p.familyId))
       .orderBy(asc(chores.sortOrder), asc(chores.name));
     return { chores: rows };
+  });
+
+  // GET /chores/suggest — age-appropriate chore catalog with per-fire
+  // amounts already priced for the family's country / currency.
+  //
+  // Inputs (all optional; sensible fallbacks below):
+  //   - `ages`:    comma-separated list of child ages. If omitted, we
+  //                read every kid in the family that has an age set.
+  //   - `country`: ISO 3166-1 alpha-2; falls back to families.country, then 'US'.
+  //   - `currency`: ISO 4217; falls back to families.currency, then the
+  //                 default for the country.
+  //   - `total`:   how many suggestions to return (default 8, max 20).
+  //
+  // The catalog itself lives in `domain/choreCatalog.ts` — every entry
+  // there carries an age range and a citation. The pricing engine in
+  // `domain/chorePricing.ts` carries the country / age / cadence math.
+  // Both are intentionally pure so the SPA can preview suggestions
+  // without writing anything (the wizard confirms before POSTing).
+  app.get('/chores/suggest', async (req) => {
+    const p = req.requireAnyMember();
+    const query = z
+      .object({
+        ages: z.string().optional(),
+        country: z.string().length(2).optional(),
+        currency: z.string().length(3).optional(),
+        total: z.coerce.number().int().min(1).max(20).optional(),
+      })
+      .parse(req.query);
+
+    const [fam] = await db.select().from(families).where(eq(families.id, p.familyId)).limit(1);
+    const country = (query.country ?? fam?.country ?? 'US').toUpperCase();
+    const currency = (
+      query.currency ??
+      fam?.currency ??
+      defaultCurrencyForCountry(country)
+    ).toUpperCase();
+
+    let ages: number[];
+    if (query.ages) {
+      ages = query.ages
+        .split(',')
+        .map((s) => Number.parseInt(s.trim(), 10))
+        .filter((n) => Number.isFinite(n) && n >= 4 && n <= 18);
+    } else {
+      const kidRows = await db
+        .select({ age: kids.age })
+        .from(kids)
+        .where(eq(kids.familyId, p.familyId));
+      ages = kidRows
+        .map((r) => r.age)
+        .filter((a): a is number => typeof a === 'number');
+    }
+    if (ages.length === 0) {
+      // No ages on file → return an empty list rather than a default
+      // 9-yo pack. The SPA's onboarding flow asks for the kid's age
+      // before this endpoint is hit, so an empty result here is a
+      // signal to render the "tell us their age first" empty state.
+      return {
+        suggestions: [],
+        country,
+        currency,
+        ages,
+      };
+    }
+
+    const picks = suggestForAges(ages, { total: query.total ?? 8 });
+    const suggestions = picks.map((c) => {
+      // Price for the youngest in-band kid for that chore — keeps
+      // suggestions humane for a 5-yo when the family also has a 14-yo
+      // who could earn $9 for the same task.
+      const eligibleAges = ages.filter((a) => a >= c.minAge && a <= c.maxAge);
+      const priceAge = eligibleAges.length > 0 ? Math.min(...eligibleAges) : Math.min(...ages);
+      const priced = suggestPriceForCatalog(c, priceAge, country, currency);
+      return {
+        slug: c.slug,
+        name: c.name,
+        description: c.description,
+        difficulty: c.difficulty,
+        category: c.category,
+        minAge: c.minAge,
+        maxAge: c.maxAge,
+        cadence: c.cadence,
+        amountCents: priced.amountCents,
+        currency: priced.currency,
+        priceForAge: priceAge,
+        source: c.source,
+        breakdown: priced.breakdown,
+      };
+    });
+    return { suggestions, country, currency, ages };
+  });
+
+  // GET /chores/catalog — full unfiltered catalog (used by AdminChores's
+  // future "Browse the chore library" picker). Same pricing engine, but
+  // priced at age 10 baseline so the displayed numbers are stable. The
+  // SPA can re-price client-side once a kid is picked.
+  app.get('/chores/catalog', async (req) => {
+    const p = req.requireAnyMember();
+    const query = z
+      .object({
+        country: z.string().length(2).optional(),
+        currency: z.string().length(3).optional(),
+        age: z.coerce.number().int().min(4).max(18).optional(),
+      })
+      .parse(req.query);
+
+    const [fam] = await db.select().from(families).where(eq(families.id, p.familyId)).limit(1);
+    const country = (query.country ?? fam?.country ?? 'US').toUpperCase();
+    const currency = (
+      query.currency ??
+      fam?.currency ??
+      defaultCurrencyForCountry(country)
+    ).toUpperCase();
+    const age = query.age ?? 10;
+
+    const items = CHORE_CATALOG.map((c) => {
+      const priced = suggestPriceForCatalog(c, age, country, currency);
+      return {
+        slug: c.slug,
+        name: c.name,
+        description: c.description,
+        difficulty: c.difficulty,
+        category: c.category,
+        minAge: c.minAge,
+        maxAge: c.maxAge,
+        cadence: c.cadence,
+        amountCents: priced.amountCents,
+        currency: priced.currency,
+        source: c.source,
+      };
+    });
+    return { catalog: items, country, currency };
   });
 
   app.post('/chores', async (req, reply) => {

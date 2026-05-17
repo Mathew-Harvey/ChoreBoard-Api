@@ -48,6 +48,7 @@ export async function familyRoutes(app: FastifyInstance): Promise<void> {
         color: kids.color,
         avatar: kids.avatar,
         gender: kids.gender,
+        age: kids.age,
       })
       .from(kids)
       .where(eq(kids.familyId, p.familyId));
@@ -62,6 +63,12 @@ export async function familyRoutes(app: FastifyInstance): Promise<void> {
         payoutDay: z.number().int().min(0).max(6).optional(),
         payoutTime: z.string().regex(/^\d{2}:\d{2}$/).optional(),
         timezone: z.string().optional(),
+        // ISO 3166-1 alpha-2; lowercased input is normalised below. Used
+        // by the chore-suggestion pricing engine. Length 2 forced to keep
+        // bad client input from poisoning the BASE_BY_COUNTRY lookup.
+        country: z.string().length(2).optional(),
+        // ISO 4217. Optional — when null we derive from `country`.
+        currency: z.string().length(3).optional(),
         // PR 11 toggle for the TV-mode champion-of-the-week chime.
         tvCelebrationSound: z.boolean().optional(),
         // Sentinel from AdminFamily → Paired devices "Hide reminder" link
@@ -86,6 +93,10 @@ export async function familyRoutes(app: FastifyInstance): Promise<void> {
     if (pairingReminderDismissed !== undefined) {
       patch.pairingReminderDismissedAt = pairingReminderDismissed ? new Date() : null;
     }
+    // Normalise country/currency to upper-case ISO codes — the chore
+    // pricing engine looks them up case-sensitively.
+    if (typeof patch.country === 'string') patch.country = patch.country.toUpperCase();
+    if (typeof patch.currency === 'string') patch.currency = patch.currency.toUpperCase();
 
     const [updated] = await db
       .update(families)
@@ -109,6 +120,12 @@ export async function familyRoutes(app: FastifyInstance): Promise<void> {
         color: z.string().regex(/^#[0-9A-Fa-f]{6}$/).default('#3B82F6'),
         avatar: z.string().optional(),
         gender: z.enum(['male', 'female', 'unspecified']).default('unspecified'),
+        // Whole-year age. Range bounds match the chore catalog's age
+        // bands (4 yo "foundational habits" up to 18 yo emancipation).
+        // Optional so callers that don't yet collect age (e.g. older
+        // SPA builds, integration tests) keep working — the suggestion
+        // endpoint just won't return tailored picks for those kids.
+        age: z.number().int().min(4).max(18).optional(),
       })
       .parse(req.body);
     // Free-tier kid cap. The SPA pre-checks via useEntitlements so a parent
@@ -132,6 +149,7 @@ export async function familyRoutes(app: FastifyInstance): Promise<void> {
         color: body.color,
         avatar: body.avatar,
         gender: body.gender,
+        age: body.age,
       })
       .returning();
     bus.publish(p.familyId, { type: 'family.updated' });
@@ -143,6 +161,7 @@ export async function familyRoutes(app: FastifyInstance): Promise<void> {
         color: k!.color,
         avatar: k!.avatar,
         gender: k!.gender,
+        age: k!.age,
       },
     };
   });
@@ -157,6 +176,7 @@ export async function familyRoutes(app: FastifyInstance): Promise<void> {
         color: z.string().regex(/^#[0-9A-Fa-f]{6}$/).optional(),
         avatar: z.string().optional(),
         gender: z.enum(['male', 'female', 'unspecified']).optional(),
+        age: z.number().int().min(4).max(18).optional(),
       })
       .parse(req.body);
     const patch: Record<string, unknown> = {};
@@ -164,6 +184,7 @@ export async function familyRoutes(app: FastifyInstance): Promise<void> {
     if (body.color !== undefined) patch.color = body.color;
     if (body.avatar !== undefined) patch.avatar = body.avatar;
     if (body.gender !== undefined) patch.gender = body.gender;
+    if (body.age !== undefined) patch.age = body.age;
     if (body.pin !== undefined) patch.pinHash = await hashPin(body.pin);
     if (Object.keys(patch).length === 0) {
       return reply.code(400).send({ error: 'no_fields' });
@@ -182,6 +203,7 @@ export async function familyRoutes(app: FastifyInstance): Promise<void> {
         color: k.color,
         avatar: k.avatar,
         gender: k.gender,
+        age: k.age,
       },
     };
   });

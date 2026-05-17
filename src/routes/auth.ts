@@ -34,6 +34,13 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         familyName: z.string().min(1).max(64),
         timezone: z.string().default('Australia/Sydney'),
         gender: z.enum(['male', 'female', 'unspecified']).default('unspecified'),
+        // Detected by the SPA at signup time (geolocation → reverse-geocode,
+        // falling back to navigator.language). Both optional so a Capacitor
+        // shell that hasn't surfaced location permission yet still signs
+        // up cleanly; AdminFamily can fill them in later. Length-checked to
+        // keep noise from poisoning the pricing engine's lookup.
+        country: z.string().length(2).optional(),
+        currency: z.string().length(3).optional(),
       })
       .parse(req.body);
 
@@ -44,7 +51,12 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
 
     const [family] = await db
       .insert(families)
-      .values({ name: body.familyName, timezone: body.timezone })
+      .values({
+        name: body.familyName,
+        timezone: body.timezone,
+        country: body.country?.toUpperCase(),
+        currency: body.currency?.toUpperCase(),
+      })
       .returning();
     const [user] = await db
       .insert(users)

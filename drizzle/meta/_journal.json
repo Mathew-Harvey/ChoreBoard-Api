@@ -71,6 +71,13 @@
       "when": 1779133200000,
       "tag": "0009_backfill_onboarding",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1779408000000,
+      "tag": "0010_age_and_locale",
+      "breakpoints": true
     }
   ]
 }

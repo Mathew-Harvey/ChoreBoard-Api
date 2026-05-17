@@ -43,6 +43,17 @@ export const families = pgTable('families', {
   payoutDay: integer('payout_day').notNull().default(0), // 0 = Sunday … 6 = Saturday
   payoutTime: text('payout_time').notNull().default('18:00'), // HH:MM, family timezone
   timezone: text('timezone').notNull().default('Australia/Sydney'),
+  // ISO 3166-1 alpha-2 country code used by the chore-suggestion pricing
+  // engine to pick local-currency base rates anchored to the RoosterMoney
+  // / HeyKit / Wells Fargo allowance surveys. Detected from the browser
+  // (geolocation → reverse-geocode, falling back to navigator.language) at
+  // signup; editable in Admin → Family afterwards. Nullable so existing
+  // families keep working until a parent visits Admin.
+  country: text('country'),
+  // ISO 4217 currency for the family's chore amounts. Defaults to the
+  // currency of `country` when null. Stored separately from `country` so a
+  // family in Ireland can pick GBP if they want.
+  currency: text('currency'),
   ownerUserId: uuid('owner_user_id'), // back-filled after first user insert
   // Set the moment a parent finishes the four-step OnboardWizard at /onboard
   // (PR 5). Until this is non-null every parent login on this family is
@@ -95,6 +106,13 @@ export const kids = pgTable(
       .references(() => families.id, { onDelete: 'cascade' }),
     name: text('name').notNull(),
     pinHash: text('pin_hash').notNull(),
+    // Whole-year age. We store age (not date of birth) because the only
+    // thing we use it for is choosing age-appropriate chores and the age
+    // multiplier in the pricing engine — both of which only need
+    // year-resolution. A future migration could move to DOB if we ever
+    // want birthday surprises; for now this matches the signup question
+    // ("How old is Skye?") one-to-one.
+    age: integer('age'),
     avatar: text('avatar'),
     color: text('color').notNull().default('#3B82F6'),
     gender: genderEnum('gender').notNull().default('unspecified'),
